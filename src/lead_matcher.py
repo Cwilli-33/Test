@@ -66,12 +66,22 @@ class LeadMatcher:
                 return contact, "BATCH_DEDUP", 92
 
         # --- 1. Match by EIN (highest confidence) ---
-        ein = self._normalize_ein(biz.get("ein"))
+        # Try full normalized EIN first; fall back to partial (last 4+) matching
+        raw_ein = biz.get("ein")
+        ein = self._normalize_ein(raw_ein)
         if ein:
             contact = await self._search_ein(ein)
             if contact:
                 logger.info(f"Matched by EIN: {ein}")
                 return contact, "EIN", 95
+        elif raw_ein:
+            # Partial EIN (e.g., last 4 digits from a masked document)
+            ein_digits = self._extract_ein_digits(raw_ein)
+            if ein_digits and len(ein_digits) >= 4:
+                contact = await self._search_ein_partial(ein_digits, raw_ein)
+                if contact:
+                    logger.info(f"Matched by partial EIN: {raw_ein}")
+                    return contact, "EIN_PARTIAL", 80
 
         # --- 2. Match by phone (business phone, then owner phone) ---
         for raw_phone in [biz.get("phone"), owner.get("phone")]:
@@ -169,12 +179,21 @@ class LeadMatcher:
             return None
 
         # Now compare current extracted fields against each recent extraction
-        new_ein = self._normalize_ein(biz.get("ein"))
-        new_phones = set()
+        raw_ein = biz.get("ein")
+        new_ein_digits = self._extract_ein_digits(raw_ein)
+
+        new_phones = set()          # normalized E.164
+        new_phone_digits = set()    # raw digits fallback
         for raw_phone in [biz.get("phone"), owner.get("phone")]:
             p = self._normalize_phone(raw_phone)
             if p:
                 new_phones.add(p)
+            # Also keep raw digits for fallback matching
+            if raw_phone:
+                d = re.sub(r"\D", "", raw_phone)
+                if len(d) >= 10:
+                    # Keep last 10 digits (strip country code)
+                    new_phone_digits.add(d[-10:])
 
         new_emails = set()
         for raw_email in [biz.get("email"), owner.get("email")]:
@@ -187,27 +206,39 @@ class LeadMatcher:
         )
 
         for ext in chat_extractions:
-            # Check EIN match
-            if new_ein and ext.ein:
-                ext_ein = self._normalize_ein(ext.ein)
-                if ext_ein and ext_ein == new_ein:
+            # Check EIN match (full or partial — handles last-4 and masked EINs)
+            if new_ein_digits and ext.ein:
+                if self._eins_match(raw_ein, ext.ein):
                     logger.info(
-                        f"Batch dedup: EIN match {new_ein} -> contact {ext.contact_id}"
+                        f"Batch dedup: EIN match '{raw_ein}' ~ '{ext.ein}' "
+                        f"-> contact {ext.contact_id}"
                     )
                     contact = await self.ghl.get_contact(ext.contact_id)
                     if contact:
                         return contact
 
-            # Check phone match
-            if new_phones and ext.owner_phone:
+            # Check phone match (normalized E.164 first, digits fallback)
+            if ext.owner_phone:
                 ext_phone = self._normalize_phone(ext.owner_phone)
-                if ext_phone and ext_phone in new_phones:
+                if ext_phone and new_phones and ext_phone in new_phones:
                     logger.info(
                         f"Batch dedup: phone match {ext_phone} -> contact {ext.contact_id}"
                     )
                     contact = await self.ghl.get_contact(ext.contact_id)
                     if contact:
                         return contact
+                # Digits-only fallback (handles edge cases where normalization
+                # fails but the raw digits clearly match)
+                if new_phone_digits:
+                    ext_digits = re.sub(r"\D", "", ext.owner_phone)
+                    if len(ext_digits) >= 10 and ext_digits[-10:] in new_phone_digits:
+                        logger.info(
+                            f"Batch dedup: phone digits match {ext_digits[-10:]} "
+                            f"-> contact {ext.contact_id}"
+                        )
+                        contact = await self.ghl.get_contact(ext.contact_id)
+                        if contact:
+                            return contact
 
             # Check email match
             if new_emails and ext.owner_email:
@@ -248,6 +279,37 @@ class LeadMatcher:
         for c in contacts:
             if self._contact_has_value(c, ein):
                 return c
+        return None
+
+    async def _search_ein_partial(
+        self, partial_digits: str, raw_ein: str
+    ) -> Optional[Dict[str, Any]]:
+        """Search GHL contacts using a partial EIN (e.g., last 4 digits).
+
+        Searches GHL for the partial digits, then uses _eins_match to
+        verify each candidate supports partial/suffix matching.
+        """
+        contacts = await self.ghl.search_contacts(partial_digits)
+        for c in contacts:
+            # Check standard fields and custom fields for an EIN that matches
+            for field in ["companyName", "tags"]:
+                field_val = c.get(field)
+                if field_val and partial_digits in str(field_val).replace("-", ""):
+                    # Possibly coincidental — need EIN-specific check
+                    pass
+
+            # Check custom fields for an EIN value
+            custom_fields = c.get("customFields", c.get("customField", []))
+            if isinstance(custom_fields, list):
+                for cf in custom_fields:
+                    cf_id = cf.get("id", cf.get("key", ""))
+                    cf_val = cf.get("field_value", cf.get("value", ""))
+                    if cf_id and "ein" in cf_id.lower() and cf_val:
+                        if self._eins_match(raw_ein, str(cf_val)):
+                            logger.info(
+                                f"Partial EIN match: '{raw_ein}' ~ '{cf_val}'"
+                            )
+                            return c
         return None
 
     async def _search_phone(self, phone: str) -> Optional[Dict[str, Any]]:
@@ -329,12 +391,68 @@ class LeadMatcher:
 
     @staticmethod
     def _normalize_ein(raw: Optional[str]) -> Optional[str]:
+        """Normalize a full 9-digit EIN to XX-XXXXXXX format.
+        Returns None if the value doesn't contain exactly 9 digits
+        (i.e., it's partial/masked).
+        """
         if not raw:
             return None
         digits = re.sub(r"\D", "", raw)
         if len(digits) == 9:
             return f"{digits[:2]}-{digits[2:]}"
         return None
+
+    @staticmethod
+    def _extract_ein_digits(raw: Optional[str]) -> Optional[str]:
+        """Extract just the digits from any EIN representation.
+
+        Works with full EINs, partial EINs, and masked EINs:
+          '12-3456789'    -> '123456789'  (full)
+          '***-**-6789'   -> '6789'       (masked, last 4)
+          'XX-XXX6789'    -> '6789'       (masked, last 4)
+          '6789'          -> '6789'       (last 4 only)
+        """
+        if not raw:
+            return None
+        digits = re.sub(r"\D", "", raw)
+        return digits if digits else None
+
+    @staticmethod
+    def _eins_match(ein_a: Optional[str], ein_b: Optional[str]) -> bool:
+        """Check if two EIN values refer to the same entity.
+
+        Handles:
+          - Full vs full:    '12-3456789' == '12-3456789'
+          - Full vs partial: '12-3456789' matches '6789'
+          - Partial vs partial: '6789' matches '6789' (only if 4+ digits)
+          - Rejects short overlaps (<4 digits) to avoid false positives
+        """
+        if not ein_a or not ein_b:
+            return False
+
+        digits_a = re.sub(r"\D", "", ein_a)
+        digits_b = re.sub(r"\D", "", ein_b)
+
+        if not digits_a or not digits_b:
+            return False
+
+        # Both full 9-digit — exact match
+        if len(digits_a) == 9 and len(digits_b) == 9:
+            return digits_a == digits_b
+
+        # One full, one partial — check if the partial is a suffix of the full
+        if len(digits_a) == 9 and 4 <= len(digits_b) <= 9:
+            return digits_a.endswith(digits_b)
+        if len(digits_b) == 9 and 4 <= len(digits_a) <= 9:
+            return digits_b.endswith(digits_a)
+
+        # Both partial — must be at least 4 digits and identical
+        if len(digits_a) >= 4 and len(digits_b) >= 4:
+            # Compare from the right (last N digits where N = shorter)
+            min_len = min(len(digits_a), len(digits_b))
+            return digits_a[-min_len:] == digits_b[-min_len:]
+
+        return False
 
     @staticmethod
     def _normalize_email(raw: Optional[str]) -> Optional[str]:
