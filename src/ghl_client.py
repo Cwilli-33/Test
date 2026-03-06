@@ -181,18 +181,21 @@ class GHLClient:
         filename: str = "lead_document.jpg",
         content_type: str = "image/jpeg",
     ) -> Optional[Dict[str, Any]]:
-        """Upload a file to a FILE_UPLOAD custom field on a contact.
+        """Upload a file to a FILE_UPLOAD custom field on a contact,
+        preserving any files already stored in that field.
 
-        Uses POST /forms/upload-custom-files (multipart/form-data).
-        Max 50 MB per file.  Multi-file fields accumulate files; each
-        call adds one more.
+        The /forms/upload-custom-files endpoint REPLACES the field value
+        on every call, so we must:
+          1. Fetch the contact to read existing files in the field.
+          2. Re-download each existing file's bytes.
+          3. POST all existing files + the new file in a single request.
 
         Args:
             contact_id: The GHL contact ID.
             custom_field_id: The GHL custom field ID (FILE_UPLOAD type).
-            file_bytes: Raw file bytes.
-            filename: Filename for the upload.
-            content_type: MIME type of the file.
+            file_bytes: Raw file bytes for the NEW file.
+            filename: Filename for the new file.
+            content_type: MIME type of the new file.
 
         Returns:
             Updated contact dict, or None on failure.
@@ -210,25 +213,51 @@ class GHLClient:
             "locationId": self.location_id,
         }
 
-        # Field name must be {customFieldId}_{randomUUID}
-        file_id = str(uuid.uuid4())
-        field_name = f"{custom_field_id}_{file_id}"
+        # -- Gather existing files so they aren't overwritten --
+        existing_files: list[tuple[str, bytes, str, str]] = []  # (filename, bytes, mime, uuid)
+        try:
+            contact = await self.get_contact(contact_id)
+            if contact:
+                cfs = contact.get("customFields", contact.get("customField", []))
+                for cf in cfs:
+                    if cf.get("id") == custom_field_id:
+                        field_val = cf.get("value")
+                        if isinstance(field_val, dict):
+                            existing_files = await self._download_existing_files(
+                                field_val
+                            )
+                        break
+        except Exception as e:
+            logger.warning(f"Could not read existing files, will upload new only: {e}")
+
+        # -- Build multi-file form --
+        # Each form field: {customFieldId}_{uuid} = (filename, bytes, mime)
+        files_payload: list[tuple[str, tuple[str, bytes, str]]] = []
+
+        # Re-include existing files under their original UUIDs
+        for ex_name, ex_bytes, ex_mime, ex_uuid in existing_files:
+            field_name = f"{custom_field_id}_{ex_uuid}"
+            files_payload.append((field_name, (ex_name, ex_bytes, ex_mime)))
+
+        # Add the new file
+        new_uuid = str(uuid.uuid4())
+        new_field_name = f"{custom_field_id}_{new_uuid}"
+        files_payload.append((new_field_name, (filename, file_bytes, content_type)))
 
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
-                files = {field_name: (filename, file_bytes, content_type)}
-
+            async with httpx.AsyncClient(timeout=90.0) as client:
                 response = await client.post(
-                    url, headers=upload_headers, params=params, files=files
+                    url, headers=upload_headers, params=params, files=files_payload
                 )
                 logger.debug(
                     f"GHL file upload response: {response.status_code} {response.text[:500]}"
                 )
                 response.raise_for_status()
                 result = response.json()
+                total = len(files_payload)
                 logger.info(
-                    f"Uploaded file '{filename}' to custom field {custom_field_id} "
-                    f"on contact {contact_id}"
+                    f"Uploaded {total} file(s) (1 new + {total - 1} existing) to "
+                    f"custom field {custom_field_id} on contact {contact_id}"
                 )
                 return result.get("contact", result)
         except httpx.HTTPStatusError as e:
@@ -239,6 +268,44 @@ class GHLClient:
         except Exception as e:
             logger.error(f"GHL file upload error: {e}", exc_info=True)
             return None
+
+    async def _download_existing_files(
+        self, field_value: dict
+    ) -> list[tuple[str, bytes, str, str]]:
+        """Download existing files from a FILE_UPLOAD custom field value.
+
+        Args:
+            field_value: Dict of {uuid: {meta: {...}, url: ..., documentId: ...}}
+
+        Returns:
+            List of (filename, file_bytes, mime_type, original_uuid) tuples.
+        """
+        results = []
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            for file_uuid, file_info in field_value.items():
+                if not isinstance(file_info, dict):
+                    continue
+                meta = file_info.get("meta", {})
+                download_url = file_info.get("url")
+                if not download_url:
+                    continue
+
+                fname = meta.get("originalname", "existing_file.jpg")
+                mime = meta.get("mimetype", "image/jpeg")
+
+                try:
+                    resp = await client.get(
+                        download_url,
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                        follow_redirects=True,
+                    )
+                    resp.raise_for_status()
+                    results.append((fname, resp.content, mime, file_uuid))
+                    logger.debug(f"Re-downloaded existing file: {fname} ({len(resp.content)} bytes)")
+                except Exception as e:
+                    logger.warning(f"Could not re-download {fname}: {e}")
+
+        return results
 
     def _format_custom_fields(self, custom_fields: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Convert a dict of custom fields to GHL v2 expected array format.
