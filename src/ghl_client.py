@@ -1,6 +1,7 @@
 """GoHighLevel API client — Private Integration (v2 API) support."""
 import httpx
 import logging
+import uuid
 from typing import Any, Dict, List, Optional
 
 from config.settings import settings
@@ -172,103 +173,71 @@ class GHLClient:
             logger.error(f"GHL get contact error: {e}", exc_info=True)
             return None
 
-    async def upload_file_to_conversation(
-        self, contact_id: str, file_bytes: bytes, filename: str = "lead_document.jpg"
-    ) -> Optional[List[str]]:
-        """Upload a file to a GHL contact's conversation and return hosted URLs.
+    async def upload_file_to_custom_field(
+        self,
+        contact_id: str,
+        custom_field_id: str,
+        file_bytes: bytes,
+        filename: str = "lead_document.jpg",
+        content_type: str = "image/jpeg",
+    ) -> Optional[Dict[str, Any]]:
+        """Upload a file to a FILE_UPLOAD custom field on a contact.
 
-        Uses POST /conversations/messages/upload (multipart/form-data).
-        Max 5 MB per file.
+        Uses POST /forms/upload-custom-files (multipart/form-data).
+        Max 50 MB per file.  Multi-file fields accumulate files; each
+        call adds one more.
 
         Args:
             contact_id: The GHL contact ID.
+            custom_field_id: The GHL custom field ID (FILE_UPLOAD type).
             file_bytes: Raw file bytes.
             filename: Filename for the upload.
+            content_type: MIME type of the file.
 
         Returns:
-            List of hosted URLs for the uploaded file, or None on failure.
+            Updated contact dict, or None on failure.
         """
-        url = f"{self.base_url}/conversations/messages/upload"
+        url = f"{self.base_url}/forms/upload-custom-files"
 
-        # Upload endpoint needs multipart — do NOT send Content-Type: application/json
         upload_headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Version": "2021-07-28",
+            "Accept": "application/json",
         }
+
+        params = {
+            "contactId": contact_id,
+            "locationId": self.location_id,
+        }
+
+        # Field name must be {customFieldId}_{randomUUID}
+        file_id = str(uuid.uuid4())
+        field_name = f"{custom_field_id}_{file_id}"
 
         try:
             async with httpx.AsyncClient(timeout=60.0) as client:
-                files = {"fileAttachment": (filename, file_bytes, "image/jpeg")}
-                data = {"contactId": contact_id}
+                files = {field_name: (filename, file_bytes, content_type)}
 
                 response = await client.post(
-                    url, headers=upload_headers, files=files, data=data
+                    url, headers=upload_headers, params=params, files=files
                 )
                 logger.debug(
-                    f"GHL upload response: {response.status_code} {response.text[:500]}"
+                    f"GHL file upload response: {response.status_code} {response.text[:500]}"
                 )
                 response.raise_for_status()
                 result = response.json()
-                uploaded_urls = result.get("uploadedFiles", result.get("urls", []))
                 logger.info(
-                    f"Uploaded file for contact {contact_id}: {uploaded_urls}"
+                    f"Uploaded file '{filename}' to custom field {custom_field_id} "
+                    f"on contact {contact_id}"
                 )
-                return uploaded_urls if uploaded_urls else None
+                return result.get("contact", result)
         except httpx.HTTPStatusError as e:
             logger.error(
-                f"GHL upload failed ({e.response.status_code}): {e.response.text}"
+                f"GHL file upload failed ({e.response.status_code}): {e.response.text}"
             )
             return None
         except Exception as e:
-            logger.error(f"GHL upload error: {e}", exc_info=True)
-            return None
-
-    async def send_conversation_message(
-        self,
-        contact_id: str,
-        message: str,
-        attachment_urls: Optional[List[str]] = None,
-    ) -> Optional[Dict[str, Any]]:
-        """Send a message (with optional attachments) to a contact's conversation.
-
-        Uses POST /conversations/messages. The message appears on the
-        contact's conversation timeline where the sales rep can see it.
-
-        Args:
-            contact_id: The GHL contact ID.
-            message: Text body of the message.
-            attachment_urls: List of hosted URLs from upload_file_to_conversation.
-
-        Returns:
-            Created message dict or None on failure.
-        """
-        url = f"{self.base_url}/conversations/messages"
-
-        payload: Dict[str, Any] = {
-            "type": "Custom",
-            "contactId": contact_id,
-            "message": message,
-        }
-        if attachment_urls:
-            payload["attachments"] = attachment_urls
-
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, headers=self.headers, json=payload)
-                logger.debug(
-                    f"GHL send msg response: {response.status_code} {response.text[:500]}"
-                )
-                response.raise_for_status()
-                result = response.json()
-                logger.info(f"Sent conversation message to contact {contact_id}")
-                return result
-        except httpx.HTTPStatusError as e:
-            logger.error(
-                f"GHL send msg failed ({e.response.status_code}): {e.response.text}"
-            )
-            return None
-        except Exception as e:
-            logger.error(f"GHL send msg error: {e}", exc_info=True)
+            logger.error(f"GHL file upload error: {e}", exc_info=True)
             return None
 
     def _format_custom_fields(self, custom_fields: Dict[str, Any]) -> List[Dict[str, Any]]:

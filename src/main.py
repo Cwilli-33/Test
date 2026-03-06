@@ -219,7 +219,9 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
                 contact_id = "failed"
                 log_step("GHL_CREATE_FAILED", "no result returned")
 
-        # ── Upload source image to contact's conversation ─────────────
+        # ── Upload source image to "Source Documents" custom field ─────
+        SOURCE_DOCS_FIELD_ID = "CCfYyWrJaoNU1Ma0K0ID"
+
         if contact_id and contact_id not in ("failed", "unknown"):
             DOC_LABELS = {
                 "MCA_APPLICATION": "MCA Application",
@@ -237,19 +239,15 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
             ext = ext_map.get(media_type, "jpg")
             filename = f"{doc_label.replace(' ', '_').lower()}_{fingerprint[:8]}.{ext}"
 
-            uploaded_urls = await ghl_client.upload_file_to_conversation(
-                contact_id, image_bytes, filename
+            upload_result = await ghl_client.upload_file_to_custom_field(
+                contact_id=contact_id,
+                custom_field_id=SOURCE_DOCS_FIELD_ID,
+                file_bytes=image_bytes,
+                filename=filename,
+                content_type=media_type,
             )
-            if uploaded_urls:
-                biz_name = extracted.get("business_info", {}).get("legal_name") or ""
-                msg_text = f"{doc_label} — {biz_name}".strip(" —") if biz_name else doc_label
-                send_result = await ghl_client.send_conversation_message(
-                    contact_id, msg_text, attachment_urls=uploaded_urls
-                )
-                if send_result:
-                    log_step("IMAGE_ATTACHED", f"image sent to conversation for {contact_id}")
-                else:
-                    log_step("IMAGE_SEND_FAILED", f"upload OK but message send failed for {contact_id}")
+            if upload_result:
+                log_step("IMAGE_ATTACHED", f"file '{filename}' uploaded to Source Documents for {contact_id}")
             else:
                 log_step("IMAGE_UPLOAD_FAILED", f"could not upload image for {contact_id}")
 
