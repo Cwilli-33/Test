@@ -94,8 +94,7 @@ Use null for any field you cannot find or that is not visible in the image.
     "total_tradelines": "Total number of tradelines",
     "now_delinquent": "Number of currently delinquent accounts",
     "num_chargeoffs": "Number of charge-offs",
-    "leverage_pct": "Credit utilization / leverage percentage as a number",
-    "statement_number": "The masked statement or account identifiers shown in a 'Statements' column or list. These look like XXXXXX5800, XXXXXXXXXXXX9112, XXXXXXXXXXXX1758 — masked numbers with X's followed by visible digits. Extract ALL unique statement numbers as a comma-separated string (e.g. 'XXXXXX5800, XXXXXXXXXXXX9112, XXXXXXXXXXXX1758'). Include the X's exactly as shown."
+    "leverage_pct": "Credit utilization / leverage percentage as a number"
   },
 
   "mca_info": {
@@ -106,6 +105,8 @@ Use null for any field you cannot find or that is not visible in the image.
     "daily_payment": "Current daily MCA payment amount",
     "remaining_balance": "Remaining balance on current MCA"
   },
+
+  "statement_numbers": "IMPORTANT: Look for ANY masked account or statement identifiers anywhere on the document. These appear in columns labeled 'Statements', 'Account', or in tables with date periods. They look like XXXXXX5800, XXXXXXXXXXXX9112, XXXXXXXXXXXX1758 — a series of X characters followed by visible digits. Extract ALL unique ones you see as a comma-separated string. Include the X's exactly as shown. If you see a table of statements with periods/dates, extract the identifiers from the left column. Return null ONLY if no such masked identifiers exist anywhere in the image.",
 
   "iso_info": {
     "iso_name": "Name of the ISO/broker who submitted this lead (from header, footer, or watermark)",
@@ -264,13 +265,14 @@ class ClaudeExtractor:
                 "fico_owner1": None, "fico_owner2": None,
                 "satisfactory_accounts": None, "total_tradelines": None,
                 "now_delinquent": None, "num_chargeoffs": None,
-                "leverage_pct": None, "statement_number": None,
+                "leverage_pct": None,
             },
             "mca_info": {
                 "has_existing_positions": None, "num_positions": None,
                 "num_existing_positions": None, "current_funder": None,
                 "daily_payment": None, "remaining_balance": None,
             },
+            "statement_numbers": None,
             "iso_info": {
                 "iso_name": None, "source_platform": None,
             },

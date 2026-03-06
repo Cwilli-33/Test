@@ -293,7 +293,9 @@ class DataMerger:
         self._set_custom_numeric(custom, existing_custom, "now_delinquent", credit.get("now_delinquent"))
         self._set_custom_numeric(custom, existing_custom, "num_chargeoffs", credit.get("num_chargeoffs"))
         self._set_custom_numeric(custom, existing_custom, "leverage_pct", credit.get("leverage_pct"))
-        self._set_custom(custom, "statement_number", credit.get("statement_number"))
+
+        # Statement numbers — top-level field from extraction (not inside credit_info)
+        self._set_custom(custom, "statement_number", extracted.get("statement_numbers"))
 
         # --- MCA positions ---
         self._set_custom_numeric(custom, existing_custom, "num_positions", mca.get("num_positions"))
