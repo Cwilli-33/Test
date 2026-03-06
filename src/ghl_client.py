@@ -1,4 +1,4 @@
-"""GoHighLevel API client for contact search, creation, and updates."""
+"""GoHighLevel API client — Private Integration (v2 API) support."""
 import httpx
 import logging
 from typing import Any, Dict, List, Optional
@@ -7,35 +7,34 @@ from config.settings import settings
 
 logger = logging.getLogger(__name__)
 
+# Private Integration keys (pit-) use the v2 API
+V2_BASE_URL = "https://services.leadconnectorhq.com"
+
 
 class GHLClient:
     def __init__(self):
         self.api_key = settings.ghl_api_key
         self.location_id = settings.ghl_location_id
-        self.base_url = settings.ghl_api_base_url.rstrip("/")
+        self.base_url = V2_BASE_URL
         self.headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
+            "Version": "2021-07-28",
         }
 
     async def search_contacts(self, query: str) -> List[Dict[str, Any]]:
-        """Search GHL contacts by a query string (phone, email, name, etc.).
-
-        Args:
-            query: Search term to look up contacts.
-
-        Returns:
-            List of matching contact dicts from GHL.
-        """
+        """Search GHL contacts by a query string."""
         url = f"{self.base_url}/contacts/"
         params = {
             "locationId": self.location_id,
             "query": query,
+            "limit": 20,
         }
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url, headers=self.headers, params=params)
+                logger.debug(f"GHL search response: {response.status_code} {response.text[:500]}")
                 response.raise_for_status()
                 data = response.json()
                 contacts = data.get("contacts", [])
@@ -51,17 +50,20 @@ class GHLClient:
     async def search_by_field(self, field: str, value: str) -> List[Dict[str, Any]]:
         """Search contacts by a specific field (email, phone).
 
-        GHL's v1 API search endpoint accepts query params for specific fields.
+        The v2 API uses 'query' param for general search. For specific fields
+        we just use the query param with the value.
         """
         url = f"{self.base_url}/contacts/"
         params = {
             "locationId": self.location_id,
-            field: value,
+            "query": value,
+            "limit": 20,
         }
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(url, headers=self.headers, params=params)
+                logger.debug(f"GHL field search response: {response.status_code} {response.text[:500]}")
                 response.raise_for_status()
                 data = response.json()
                 contacts = data.get("contacts", [])
@@ -75,12 +77,12 @@ class GHLClient:
             return []
 
     async def create_contact(self, contact_data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Create a new contact in GHL.
+        """Create a new contact in GHL via v2 API.
 
         Args:
             contact_data: Dict with contact fields. Expected keys:
                 - firstName, lastName, email, phone, companyName, address1,
-                  city, state, postalCode, website, tags, customField, source
+                  city, state, postalCode, website, tags, customFields, source
 
         Returns:
             Created contact dict from GHL, or None on failure.
@@ -92,13 +94,19 @@ class GHLClient:
             **contact_data,
         }
 
-        # Format custom fields as GHL expects
-        if "customField" in payload and isinstance(payload["customField"], dict):
-            payload["customField"] = self._format_custom_fields(payload["customField"])
+        # v2 API uses "customFields" (not "customField") as an array of {id, field_value}
+        if "customField" in payload:
+            cf = payload.pop("customField")
+            if isinstance(cf, dict):
+                payload["customFields"] = self._format_custom_fields(cf)
+            elif isinstance(cf, list):
+                payload["customFields"] = cf
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
+                logger.debug(f"GHL create payload: {payload}")
                 response = await client.post(url, headers=self.headers, json=payload)
+                logger.debug(f"GHL create response: {response.status_code} {response.text[:500]}")
                 response.raise_for_status()
                 result = response.json()
                 contact = result.get("contact", result)
@@ -117,25 +125,22 @@ class GHLClient:
     async def update_contact(
         self, contact_id: str, contact_data: Dict[str, Any]
     ) -> Optional[Dict[str, Any]]:
-        """Update an existing contact in GHL.
-
-        Args:
-            contact_id: GHL contact ID.
-            contact_data: Dict of fields to update.
-
-        Returns:
-            Updated contact dict, or None on failure.
-        """
+        """Update an existing contact in GHL via v2 API."""
         url = f"{self.base_url}/contacts/{contact_id}"
 
         payload = {**contact_data}
 
-        if "customField" in payload and isinstance(payload["customField"], dict):
-            payload["customField"] = self._format_custom_fields(payload["customField"])
+        if "customField" in payload:
+            cf = payload.pop("customField")
+            if isinstance(cf, dict):
+                payload["customFields"] = self._format_custom_fields(cf)
+            elif isinstance(cf, list):
+                payload["customFields"] = cf
 
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.put(url, headers=self.headers, json=payload)
+                logger.debug(f"GHL update response: {response.status_code} {response.text[:500]}")
                 response.raise_for_status()
                 result = response.json()
                 contact = result.get("contact", result)
@@ -151,14 +156,7 @@ class GHLClient:
             return None
 
     async def get_contact(self, contact_id: str) -> Optional[Dict[str, Any]]:
-        """Fetch a single contact by ID.
-
-        Args:
-            contact_id: GHL contact ID.
-
-        Returns:
-            Contact dict, or None on failure.
-        """
+        """Fetch a single contact by ID."""
         url = f"{self.base_url}/contacts/{contact_id}"
 
         try:
@@ -175,9 +173,13 @@ class GHLClient:
             return None
 
     def _format_custom_fields(self, custom_fields: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Convert a dict of custom fields to GHL's expected array format.
+        """Convert a dict of custom fields to GHL v2 expected array format.
 
-        GHL expects: [{"id": "field_key", "value": "field_value"}, ...]
-        We accept:   {"field_key": "field_value", ...}
+        v2 API expects: [{"id": "field_key", "field_value": "value"}, ...]
+        We accept:      {"field_key": "value", ...}
         """
-        return [{"id": k, "value": v} for k, v in custom_fields.items() if v is not None]
+        return [
+            {"id": k, "field_value": v}
+            for k, v in custom_fields.items()
+            if v is not None
+        ]
