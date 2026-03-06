@@ -219,6 +219,40 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
                 contact_id = "failed"
                 log_step("GHL_CREATE_FAILED", "no result returned")
 
+        # ── Upload source image to contact's conversation ─────────────
+        if contact_id and contact_id not in ("failed", "unknown"):
+            DOC_LABELS = {
+                "MCA_APPLICATION": "MCA Application",
+                "BANK_STATEMENT": "Bank Statement",
+                "CREDIT_REPORT": "Credit Report",
+                "TAX_DOCUMENT": "Tax Document",
+                "BUSINESS_DOCUMENT": "Business Document",
+                "CRM_SCREENSHOT": "CRM Screenshot",
+                "OTHER": "Document",
+            }
+            doc_label = DOC_LABELS.get(document_type, "Document")
+
+            # Determine file extension from media type
+            ext_map = {"image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif"}
+            ext = ext_map.get(media_type, "jpg")
+            filename = f"{doc_label.replace(' ', '_').lower()}_{fingerprint[:8]}.{ext}"
+
+            uploaded_urls = await ghl_client.upload_file_to_conversation(
+                contact_id, image_bytes, filename
+            )
+            if uploaded_urls:
+                biz_name = extracted.get("business_info", {}).get("legal_name") or ""
+                msg_text = f"{doc_label} — {biz_name}".strip(" —") if biz_name else doc_label
+                send_result = await ghl_client.send_conversation_message(
+                    contact_id, msg_text, attachment_urls=uploaded_urls
+                )
+                if send_result:
+                    log_step("IMAGE_ATTACHED", f"image sent to conversation for {contact_id}")
+                else:
+                    log_step("IMAGE_SEND_FAILED", f"upload OK but message send failed for {contact_id}")
+            else:
+                log_step("IMAGE_UPLOAD_FAILED", f"could not upload image for {contact_id}")
+
         # ── Record in local database ─────────────────────────────────────
         biz = extracted.get("business_info", {}) or {}
         owner = extracted.get("owner_info", {}) or {}

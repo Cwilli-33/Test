@@ -172,6 +172,105 @@ class GHLClient:
             logger.error(f"GHL get contact error: {e}", exc_info=True)
             return None
 
+    async def upload_file_to_conversation(
+        self, contact_id: str, file_bytes: bytes, filename: str = "lead_document.jpg"
+    ) -> Optional[List[str]]:
+        """Upload a file to a GHL contact's conversation and return hosted URLs.
+
+        Uses POST /conversations/messages/upload (multipart/form-data).
+        Max 5 MB per file.
+
+        Args:
+            contact_id: The GHL contact ID.
+            file_bytes: Raw file bytes.
+            filename: Filename for the upload.
+
+        Returns:
+            List of hosted URLs for the uploaded file, or None on failure.
+        """
+        url = f"{self.base_url}/conversations/messages/upload"
+
+        # Upload endpoint needs multipart — do NOT send Content-Type: application/json
+        upload_headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Version": "2021-07-28",
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                files = {"fileAttachment": (filename, file_bytes, "image/jpeg")}
+                data = {"contactId": contact_id}
+
+                response = await client.post(
+                    url, headers=upload_headers, files=files, data=data
+                )
+                logger.debug(
+                    f"GHL upload response: {response.status_code} {response.text[:500]}"
+                )
+                response.raise_for_status()
+                result = response.json()
+                uploaded_urls = result.get("uploadedFiles", result.get("urls", []))
+                logger.info(
+                    f"Uploaded file for contact {contact_id}: {uploaded_urls}"
+                )
+                return uploaded_urls if uploaded_urls else None
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"GHL upload failed ({e.response.status_code}): {e.response.text}"
+            )
+            return None
+        except Exception as e:
+            logger.error(f"GHL upload error: {e}", exc_info=True)
+            return None
+
+    async def send_conversation_message(
+        self,
+        contact_id: str,
+        message: str,
+        attachment_urls: Optional[List[str]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Send a message (with optional attachments) to a contact's conversation.
+
+        Uses POST /conversations/messages. The message appears on the
+        contact's conversation timeline where the sales rep can see it.
+
+        Args:
+            contact_id: The GHL contact ID.
+            message: Text body of the message.
+            attachment_urls: List of hosted URLs from upload_file_to_conversation.
+
+        Returns:
+            Created message dict or None on failure.
+        """
+        url = f"{self.base_url}/conversations/messages"
+
+        payload: Dict[str, Any] = {
+            "type": "Custom",
+            "contactId": contact_id,
+            "message": message,
+        }
+        if attachment_urls:
+            payload["attachments"] = attachment_urls
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=self.headers, json=payload)
+                logger.debug(
+                    f"GHL send msg response: {response.status_code} {response.text[:500]}"
+                )
+                response.raise_for_status()
+                result = response.json()
+                logger.info(f"Sent conversation message to contact {contact_id}")
+                return result
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                f"GHL send msg failed ({e.response.status_code}): {e.response.text}"
+            )
+            return None
+        except Exception as e:
+            logger.error(f"GHL send msg error: {e}", exc_info=True)
+            return None
+
     def _format_custom_fields(self, custom_fields: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Convert a dict of custom fields to GHL v2 expected array format.
 
