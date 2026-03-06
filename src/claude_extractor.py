@@ -95,7 +95,7 @@ Use null for any field you cannot find or that is not visible in the image.
     "now_delinquent": "Number of currently delinquent accounts",
     "num_chargeoffs": "Number of charge-offs",
     "leverage_pct": "Credit utilization / leverage percentage as a number",
-    "statement_number": "Statement number / reference number / report ID shown on credit reports or financial scrub documents (e.g. 'STM-12345', '20260305-001', or any unique identifier printed on the document)"
+    "statement_number": "The masked statement or account identifiers shown in a 'Statements' column or list. These look like XXXXXX5800, XXXXXXXXXXXX9112, XXXXXXXXXXXX1758 — masked numbers with X's followed by visible digits. Extract ALL unique statement numbers as a comma-separated string (e.g. 'XXXXXX5800, XXXXXXXXXXXX9112, XXXXXXXXXXXX1758'). Include the X's exactly as shown."
   },
 
   "mca_info": {
