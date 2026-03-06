@@ -1,10 +1,66 @@
-"""Smart data merging — combines extracted data with existing GHL contact data."""
+"""Smart data merging — combines extracted data with existing GHL contact data.
+
+Maps extracted fields to exact GHL custom field IDs for the location.
+"""
 import json
 import logging
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# GHL Custom Field ID mapping (from location xUrzKPGPYMeo1BSR9a0P)
+# ---------------------------------------------------------------------------
+# These IDs come from the GHL API: GET /locations/{id}/customFields
+# The key is a readable name; the value is the GHL field ID.
+
+GHL_CUSTOM_FIELDS = {
+    # Business identifiers
+    "ein":                      "24QthvUKjKiEWBJr5kGN",
+    "dba":                      "e34gazjAyNSaDXIWZOmq",
+    "business_start_date":      "TtdjtsXprss3caSuPyXP",
+    "state_of_incorporation":   "XFs2Swg2iv7eUcj18MI5",
+    "industry":                 "3ZAqSshPhgXPUlLjRUNd",
+    "business_phone":           "Mk6gFArjGHC91aosp0ql",
+    "funding_requested":        "Qi236dvs25FS7laGaWq9",
+
+    # Owner 2
+    "owner_2_name":             "6COH4V1v30QoSgruiZpO",
+    "owner_2_phone":            "LddyH78lQfPPfdvVFIGk",
+
+    # Financials
+    "monthly_revenue":          "4nwh9GkL87CPx3rvYXte",
+    "avg_daily_balance":        "Cwd0VoL1uJq5cyM9pfAB",
+    "true_revenue_avg_3mo":     "jsqyKetf6dr66ku3vQXb",
+
+    # Credit
+    "fico_owner1":              "8xhJtYRSWIy1fxBmrO0n",
+    "fico_owner2":              "SSSP2fzyfGVUMsghsaL0",
+    "satisfactory_accounts":    "kJPaOajlJy1cqSSIZBcz",
+    "total_tradelines":         "NJbDArsoKKJuCLSb8Eoj",
+    "now_delinquent":           "3NHx3LTaUEnxFUdPo0wo",
+    "num_chargeoffs":           "oABAg6qGnNSortIGFGwy",
+    "leverage_pct":             "oJZ9IERN5LL8BWMjTSiq",
+
+    # MCA positions
+    "num_positions":            "fKaTtIOb9JTypnAMUhx4",
+    "num_existing_positions":   "FRvcdvhGlUqp9q9ewfXD",
+
+    # Owner 1 home address
+    "owner1_address":           "DUonmL5QgCisIDqFlPLy",
+    "owner1_city":              "Pn4y4ppf4R5PLjJwRzcQ",
+    "owner1_state":             "qAhft8fEIXB4A9fdmJLp",
+    "owner1_zip":               "harMFyX4xvXghV4ksksB",
+
+    # Metadata
+    "ai_confidence":            "JAkXR6AT0kMzSm25b7Dt",
+    "ai_flags":                 "xoReYLVOg7u0sb4flE0S",
+    "batch_date":               "f7D788L5PQXxQHBZ1uRj",
+    "iso_name":                 "A907hIwQGuzA0K6HLSeI",
+    "source_platform":          "rHO4Rb6Fi8J9Rb6Oxz0I",
+}
 
 
 class DataMerger:
@@ -14,7 +70,7 @@ class DataMerger:
         - Never overwrite existing data with empty/null values.
         - For numeric fields (revenue, credit score), prefer the higher or newer value.
         - For tags, append new tags without duplicating existing ones.
-        - Custom fields are merged individually.
+        - Custom fields are mapped by exact GHL field IDs.
     """
 
     def merge(
@@ -30,7 +86,7 @@ class DataMerger:
         Args:
             existing_contact: Current contact dict from GHL.
             extracted: Extraction result from ClaudeExtractor.
-            match_method: How the match was made (EIN, PHONE, EMAIL, NAME).
+            match_method: How the match was made (EIN, PHONE, EMAIL, NAME, etc.).
             match_confidence: 0-100 confidence in the match.
 
         Returns:
@@ -38,8 +94,11 @@ class DataMerger:
         """
         biz = extracted.get("business_info", {}) or {}
         owner = extracted.get("owner_info", {}) or {}
+        owner2 = extracted.get("owner2_info", {}) or {}
         fin = extracted.get("financial_info", {}) or {}
-        mca = extracted.get("mca_history", {}) or {}
+        credit = extracted.get("credit_info", {}) or {}
+        mca = extracted.get("mca_info", {}) or {}
+        iso = extracted.get("iso_info", {}) or {}
 
         update: Dict[str, Any] = {}
 
@@ -53,10 +112,12 @@ class DataMerger:
             match_method,
         )
 
-        # --- Custom fields ---
-        custom = self._build_custom_fields(existing_contact, biz, owner, fin, mca, extracted)
+        # --- Custom fields (using GHL field IDs) ---
+        custom = self._build_custom_fields(
+            existing_contact, biz, owner, owner2, fin, credit, mca, iso, extracted
+        )
         if custom:
-            update["customField"] = custom
+            update["customFields"] = self._format_custom_fields(custom)
 
         logger.info(
             f"Merged data for contact (match={match_method}, confidence={match_confidence}): "
@@ -72,8 +133,11 @@ class DataMerger:
         """
         biz = extracted.get("business_info", {}) or {}
         owner = extracted.get("owner_info", {}) or {}
+        owner2 = extracted.get("owner2_info", {}) or {}
         fin = extracted.get("financial_info", {}) or {}
-        mca = extracted.get("mca_history", {}) or {}
+        credit = extracted.get("credit_info", {}) or {}
+        mca = extracted.get("mca_info", {}) or {}
+        iso = extracted.get("iso_info", {}) or {}
 
         contact: Dict[str, Any] = {}
 
@@ -120,9 +184,11 @@ class DataMerger:
         contact["source"] = "Telegram MCA Pipeline"
 
         # Custom fields
-        custom = self._build_custom_fields({}, biz, owner, fin, mca, extracted)
+        custom = self._build_custom_fields(
+            {}, biz, owner, owner2, fin, credit, mca, iso, extracted
+        )
         if custom:
-            contact["customField"] = custom
+            contact["customFields"] = self._format_custom_fields(custom)
 
         return contact
 
@@ -177,76 +243,80 @@ class DataMerger:
         existing: Dict[str, Any],
         biz: Dict[str, Any],
         owner: Dict[str, Any],
+        owner2: Dict[str, Any],
         fin: Dict[str, Any],
+        credit: Dict[str, Any],
         mca: Dict[str, Any],
+        iso: Dict[str, Any],
         extracted: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """Build a dict of custom field values to set/update.
+        """Build a dict of {ghl_field_id: value} for custom fields.
 
-        GHLClient._format_custom_fields will convert this to the array format
-        GHL expects before sending.
+        Uses the GHL_CUSTOM_FIELDS mapping to produce exact field IDs.
         """
         custom: Dict[str, Any] = {}
-
-        # Business identifiers
-        if biz.get("ein"):
-            custom["ein"] = biz["ein"]
-        if biz.get("dba"):
-            custom["dba_name"] = biz["dba"]
-        if biz.get("entity_type"):
-            custom["entity_type"] = biz["entity_type"]
-        if biz.get("industry"):
-            custom["industry"] = biz["industry"]
-        if biz.get("start_date"):
-            custom["business_start_date"] = biz["start_date"]
-        if biz.get("time_in_business_months"):
-            custom["time_in_business_months"] = str(biz["time_in_business_months"])
-
-        # Owner extras
-        if owner.get("title"):
-            custom["owner_title"] = owner["title"]
-        if owner.get("ownership_percentage"):
-            custom["ownership_pct"] = str(owner["ownership_percentage"])
-
-        # Financials — prefer higher revenue, newer credit score
         existing_custom = self._existing_custom_map(existing)
 
-        if fin.get("monthly_revenue"):
-            existing_rev = self._to_float(existing_custom.get("monthly_revenue"))
-            new_rev = self._to_float(fin["monthly_revenue"])
-            if new_rev and (not existing_rev or new_rev > existing_rev):
-                custom["monthly_revenue"] = str(fin["monthly_revenue"])
+        # --- Business identifiers ---
+        self._set_custom(custom, "ein", biz.get("ein"))
+        self._set_custom(custom, "dba", biz.get("dba"))
+        self._set_custom(custom, "business_start_date", biz.get("start_date"))
+        self._set_custom(custom, "state_of_incorporation", biz.get("state_of_incorporation"))
+        self._set_custom(custom, "industry", biz.get("industry"))
+        self._set_custom(custom, "business_phone", biz.get("phone"))
+        self._set_custom_numeric(custom, existing_custom, "funding_requested", fin.get("funding_requested"))
 
-        if fin.get("annual_revenue"):
-            custom["annual_revenue"] = str(fin["annual_revenue"])
+        # --- Owner 2 ---
+        self._set_custom(custom, "owner_2_name", owner2.get("full_name"))
+        self._set_custom(custom, "owner_2_phone", owner2.get("phone"))
 
-        if fin.get("requested_amount"):
-            custom["requested_amount"] = str(fin["requested_amount"])
+        # --- Financials (prefer higher revenue, newer values) ---
+        self._set_custom_numeric_prefer_higher(
+            custom, existing_custom, "monthly_revenue", fin.get("monthly_revenue")
+        )
+        self._set_custom_numeric(custom, existing_custom, "avg_daily_balance", fin.get("avg_daily_balance"))
+        self._set_custom_numeric_prefer_higher(
+            custom, existing_custom, "true_revenue_avg_3mo", fin.get("true_revenue_avg_3mo")
+        )
 
-        if fin.get("use_of_funds"):
-            custom["use_of_funds"] = fin["use_of_funds"]
+        # --- Credit info ---
+        self._set_custom_numeric(custom, existing_custom, "fico_owner1", credit.get("fico_owner1"))
+        self._set_custom_numeric(
+            custom, existing_custom, "fico_owner2",
+            credit.get("fico_owner2") or owner2.get("fico")
+        )
+        self._set_custom_numeric(custom, existing_custom, "satisfactory_accounts", credit.get("satisfactory_accounts"))
+        self._set_custom_numeric(custom, existing_custom, "total_tradelines", credit.get("total_tradelines"))
+        self._set_custom_numeric(custom, existing_custom, "now_delinquent", credit.get("now_delinquent"))
+        self._set_custom_numeric(custom, existing_custom, "num_chargeoffs", credit.get("num_chargeoffs"))
+        self._set_custom_numeric(custom, existing_custom, "leverage_pct", credit.get("leverage_pct"))
 
-        if fin.get("credit_score"):
-            # Always prefer the newest credit score
-            custom["credit_score"] = str(fin["credit_score"])
+        # --- MCA positions ---
+        self._set_custom_numeric(custom, existing_custom, "num_positions", mca.get("num_positions"))
+        self._set_custom_numeric(custom, existing_custom, "num_existing_positions", mca.get("num_existing_positions"))
 
-        # MCA history
-        if mca.get("has_existing_mca") is not None:
-            custom["has_existing_mca"] = str(mca["has_existing_mca"]).lower()
-        if mca.get("current_funder"):
-            custom["current_mca_funder"] = mca["current_funder"]
-        if mca.get("daily_payment"):
-            custom["mca_daily_payment"] = str(mca["daily_payment"])
-        if mca.get("remaining_balance"):
-            custom["mca_remaining_balance"] = str(mca["remaining_balance"])
-        if mca.get("position"):
-            custom["mca_position"] = str(mca["position"])
+        # --- Owner 1 home address ---
+        self._set_custom(custom, "owner1_address", owner.get("home_address"))
+        self._set_custom(custom, "owner1_city", owner.get("home_city"))
+        self._set_custom(custom, "owner1_state", owner.get("home_state"))
+        self._set_custom(custom, "owner1_zip", owner.get("home_zip"))
 
-        # Document metadata
-        if extracted.get("document_type"):
-            custom["last_document_type"] = extracted["document_type"]
-        if extracted.get("confidence"):
-            custom["extraction_confidence"] = str(round(extracted["confidence"], 2))
+        # --- ISO / Source ---
+        self._set_custom(custom, "iso_name", iso.get("iso_name"))
+        self._set_custom(custom, "source_platform", iso.get("source_platform") or "Telegram")
+
+        # --- Metadata ---
+        confidence = extracted.get("confidence")
+        if confidence is not None:
+            custom[GHL_CUSTOM_FIELDS["ai_confidence"]] = str(round(float(confidence), 2))
+
+        # Build AI flags
+        flags = self._build_ai_flags(extracted)
+        if flags:
+            custom[GHL_CUSTOM_FIELDS["ai_flags"]] = ", ".join(flags)
+
+        # Batch date (today's date as YYYYMMDD for sorting)
+        custom[GHL_CUSTOM_FIELDS["batch_date"]] = datetime.utcnow().strftime("%Y%m%d")
 
         return custom
 
@@ -273,14 +343,22 @@ class DataMerger:
         if match_method:
             new_tags.append(f"matched-{match_method.lower()}")
 
-        mca = extracted.get("mca_history", {}) or {}
-        if mca.get("has_existing_mca"):
+        mca = extracted.get("mca_info", {}) or {}
+        if mca.get("has_existing_positions") or mca.get("num_positions"):
             new_tags.append("existing-mca")
 
         fin = extracted.get("financial_info", {}) or {}
         rev = self._to_float(fin.get("monthly_revenue"))
         if rev and rev >= 50000:
             new_tags.append("high-revenue")
+
+        credit = extracted.get("credit_info", {}) or {}
+        fico = self._to_float(credit.get("fico_owner1"))
+        if fico:
+            if fico >= 700:
+                new_tags.append("fico-700+")
+            elif fico < 550:
+                new_tags.append("fico-sub550")
 
         # Deduplicate (case-insensitive) while preserving order
         seen = {t.lower() for t in tags}
@@ -290,6 +368,93 @@ class DataMerger:
                 seen.add(t.lower())
 
         return tags
+
+    def _build_ai_flags(self, extracted: Dict[str, Any]) -> List[str]:
+        """Generate AI-derived flags/warnings about the lead."""
+        flags = []
+        credit = extracted.get("credit_info", {}) or {}
+        fin = extracted.get("financial_info", {}) or {}
+        mca = extracted.get("mca_info", {}) or {}
+
+        fico = self._to_float(credit.get("fico_owner1"))
+        if fico and fico < 550:
+            flags.append("LOW_FICO")
+
+        delinquent = self._to_float(credit.get("now_delinquent"))
+        if delinquent and delinquent > 3:
+            flags.append("HIGH_DELINQUENCY")
+
+        chargeoffs = self._to_float(credit.get("num_chargeoffs"))
+        if chargeoffs and chargeoffs > 0:
+            flags.append("HAS_CHARGEOFFS")
+
+        leverage = self._to_float(credit.get("leverage_pct"))
+        if leverage and leverage > 80:
+            flags.append("HIGH_LEVERAGE")
+
+        positions = self._to_float(mca.get("num_positions"))
+        if positions and positions >= 3:
+            flags.append("3+_POSITIONS")
+
+        rev = self._to_float(fin.get("monthly_revenue"))
+        if rev and rev < 15000:
+            flags.append("LOW_REVENUE")
+
+        confidence = self._to_float(extracted.get("confidence"))
+        if confidence and confidence < 0.7:
+            flags.append("LOW_AI_CONFIDENCE")
+
+        return flags
+
+    # -------------------------------------------------------------------------
+    # Custom field helpers
+    # -------------------------------------------------------------------------
+
+    def _set_custom(self, custom: Dict, field_name: str, value: Any) -> None:
+        """Set a custom field by name (maps to GHL ID) if value is non-empty."""
+        if not value:
+            return
+        ghl_id = GHL_CUSTOM_FIELDS.get(field_name)
+        if ghl_id:
+            custom[ghl_id] = str(value)
+
+    def _set_custom_numeric(
+        self, custom: Dict, existing_custom: Dict, field_name: str, value: Any
+    ) -> None:
+        """Set a numeric custom field, always preferring a new non-null value."""
+        new_val = self._to_float(value)
+        if new_val is None:
+            return
+        ghl_id = GHL_CUSTOM_FIELDS.get(field_name)
+        if ghl_id:
+            custom[ghl_id] = str(new_val)
+
+    def _set_custom_numeric_prefer_higher(
+        self, custom: Dict, existing_custom: Dict, field_name: str, value: Any
+    ) -> None:
+        """Set a numeric custom field, preferring the higher of existing vs new."""
+        new_val = self._to_float(value)
+        if new_val is None:
+            return
+        ghl_id = GHL_CUSTOM_FIELDS.get(field_name)
+        if not ghl_id:
+            return
+        existing_val = self._to_float(existing_custom.get(ghl_id))
+        if existing_val and existing_val > new_val:
+            return  # Keep existing higher value
+        custom[ghl_id] = str(new_val)
+
+    @staticmethod
+    def _format_custom_fields(custom: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Convert {ghl_id: value} dict to GHL v2 API array format.
+
+        v2 API expects: [{"id": "field_id", "field_value": "value"}, ...]
+        """
+        return [
+            {"id": k, "field_value": v}
+            for k, v in custom.items()
+            if v is not None
+        ]
 
     # -------------------------------------------------------------------------
     # Utility methods
@@ -311,13 +476,14 @@ class DataMerger:
 
     @staticmethod
     def _existing_custom_map(contact: Dict[str, Any]) -> Dict[str, str]:
-        """Convert GHL custom field array to a simple dict for lookups."""
+        """Convert GHL custom field array to a simple {id: value} dict for lookups."""
         result: Dict[str, str] = {}
-        custom_fields = contact.get("customField", [])
+        # v2 API returns customFields as array
+        custom_fields = contact.get("customFields", contact.get("customField", []))
         if isinstance(custom_fields, list):
             for cf in custom_fields:
                 fid = cf.get("id", "")
-                fval = cf.get("value", "")
+                fval = cf.get("field_value", cf.get("value", ""))
                 if fid and fval:
                     result[fid] = str(fval)
         return result
@@ -327,6 +493,10 @@ class DataMerger:
         if val is None:
             return None
         try:
+            # Handle strings like "$50,000" or "75%"
+            if isinstance(val, str):
+                cleaned = val.replace("$", "").replace(",", "").replace("%", "").strip()
+                return float(cleaned) if cleaned else None
             return float(val)
         except (ValueError, TypeError):
             return None
