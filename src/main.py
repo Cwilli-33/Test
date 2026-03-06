@@ -2,7 +2,10 @@
 import json
 import logging
 import sys
+import traceback
+from collections import deque
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI, Request, Depends
 from fastapi.responses import JSONResponse
@@ -18,11 +21,14 @@ from src.data_merger import DataMerger
 from src.models import LeadExtraction
 
 logging.basicConfig(
-    level=settings.log_level,
+    level="DEBUG",
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+# Store last 20 webhook results for debugging via /admin/debug
+_debug_log = deque(maxlen=20)
 
 
 @asynccontextmanager
@@ -30,6 +36,10 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Telegram → GHL Pipeline...")
     init_db()
     logger.info("Database initialized")
+    logger.info(f"Bot token set: {bool(settings.telegram_bot_token)}")
+    logger.info(f"Claude key set: {bool(settings.claude_api_key)}")
+    logger.info(f"GHL key set: {bool(settings.ghl_api_key)}")
+    logger.info(f"GHL location: {settings.ghl_location_id}")
     yield
     logger.info("Shutting down...")
 
@@ -72,90 +82,105 @@ async def health_check():
 
 
 # ---------------------------------------------------------------------------
+# Debug endpoint — view recent webhook activity
+# ---------------------------------------------------------------------------
+
+@app.get("/admin/debug")
+async def debug_log():
+    """View the last 20 webhook processing results."""
+    return {"count": len(_debug_log), "events": list(_debug_log)}
+
+
+# ---------------------------------------------------------------------------
 # Telegram webhook
 # ---------------------------------------------------------------------------
 
 @app.post("/webhook/telegram")
 async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db)):
-    """Process incoming Telegram messages containing images.
+    """Process incoming Telegram messages containing images."""
+    event = {"timestamp": datetime.utcnow().isoformat(), "steps": []}
 
-    Pipeline:
-        1. Extract image metadata from Telegram message
-        2. Fingerprint and check for duplicates
-        3. Download image and encode to base64
-        4. Send to Claude Vision for structured extraction
-        5. Search GHL for existing matching contact
-        6. Create or update contact in GHL
-        7. Record extraction in local DB for audit trail
-    """
+    def log_step(step: str, detail: str = ""):
+        entry = {"step": step, "detail": detail}
+        event["steps"].append(entry)
+        logger.info(f"[PIPELINE] {step}: {detail}")
+
     try:
         data = await request.json()
-        logger.info(f"Received Telegram webhook: keys={list(data.keys())}")
+        log_step("RECEIVED", f"keys={list(data.keys())}")
 
         # ── Extract the message ──────────────────────────────────────────
         message = data.get("message") or data.get("channel_post")
         if not message:
-            logger.info(f"Webhook contained no message — ignoring. Full payload keys: {list(data.keys())}")
+            log_step("IGNORED", f"no message key. payload keys: {list(data.keys())}")
+            event["result"] = "ignored_no_message"
+            _debug_log.append(event)
             return {"status": "ignored", "reason": "no_message"}
 
-        logger.info(
-            f"Message from chat {message.get('chat', {}).get('id')} "
-            f"(type={message.get('chat', {}).get('type')}), "
-            f"has photo={bool(message.get('photo'))}, "
-            f"has document={bool(message.get('document'))}"
-        )
+        chat_info = message.get("chat", {})
+        log_step("MESSAGE", (
+            f"chat_id={chat_info.get('id')}, "
+            f"type={chat_info.get('type')}, "
+            f"has_photo={bool(message.get('photo'))}, "
+            f"has_document={bool(message.get('document'))}, "
+            f"has_text={bool(message.get('text'))}"
+        ))
 
         # ── Check for an image ───────────────────────────────────────────
         image_info = image_processor.extract_image_from_message(message)
         if not image_info:
-            logger.info("Message has no photo or image document — ignoring")
+            log_step("IGNORED", "no photo or image document in message")
+            event["result"] = "ignored_no_photo"
+            _debug_log.append(event)
             return {"status": "ignored", "reason": "no_photo"}
 
         file_id = image_info["file_id"]
         file_size = image_info["file_size"]
+        log_step("IMAGE_FOUND", f"file_id={file_id[:20]}..., size={file_size}")
 
         # ── Duplicate check ──────────────────────────────────────────────
         fingerprint = image_processor.create_fingerprint(file_id, file_size)
         if image_processor.is_duplicate(fingerprint, db):
-            return {
-                "status": "skipped",
-                "reason": "duplicate_image",
-                "fingerprint": fingerprint,
-            }
+            log_step("SKIPPED", f"duplicate fingerprint={fingerprint}")
+            event["result"] = "skipped_duplicate"
+            _debug_log.append(event)
+            return {"status": "skipped", "reason": "duplicate_image", "fingerprint": fingerprint}
 
-        logger.info(f"Processing new image: fingerprint={fingerprint}")
+        log_step("FINGERPRINT", fingerprint)
 
         # ── Download and encode ──────────────────────────────────────────
         image_bytes = await image_processor.download_image(file_id)
         image_base64 = image_processor.image_to_base64(image_bytes)
-
-        # Use media type detected by image processor
         media_type = image_info.get("media_type", "image/jpeg")
+        log_step("DOWNLOADED", f"{len(image_bytes)} bytes, type={media_type}")
 
         # ── Extract data with Claude Vision ──────────────────────────────
         extracted = await claude_extractor.extract(image_base64, media_type)
 
         confidence = extracted.get("confidence", 0.0)
         document_type = extracted.get("document_type", "OTHER")
+        extraction_error = extracted.get("extraction_error")
+
+        log_step("EXTRACTED", (
+            f"confidence={confidence}, type={document_type}, "
+            f"error={extraction_error}, "
+            f"biz_name={extracted.get('business_info', {}).get('legal_name')}"
+        ))
 
         if confidence < settings.min_confidence_threshold:
-            logger.warning(
-                f"Extraction below confidence threshold "
-                f"({confidence:.2f} < {settings.min_confidence_threshold}) — skipping"
-            )
+            log_step("SKIPPED", f"low confidence {confidence} < {settings.min_confidence_threshold}")
             image_processor.mark_as_processed(
                 fingerprint, image_info,
                 contact_id=None, action="SKIPPED_LOW_CONFIDENCE",
                 confidence=confidence, document_type=document_type, db=db,
             )
-            return {
-                "status": "skipped",
-                "reason": "low_confidence",
-                "confidence": confidence,
-            }
+            event["result"] = "skipped_low_confidence"
+            _debug_log.append(event)
+            return {"status": "skipped", "reason": "low_confidence", "confidence": confidence}
 
         # ── Match against existing GHL contacts ──────────────────────────
         matched_contact, match_method, match_confidence = await lead_matcher.find_match(extracted)
+        log_step("MATCHED", f"method={match_method}, confidence={match_confidence}, found={bool(matched_contact)}")
 
         contact_id: str
         action: str
@@ -166,29 +191,28 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
             update_payload = data_merger.merge(
                 matched_contact, extracted, match_method, match_confidence
             )
+            log_step("MERGING", f"updating contact {contact_id}")
             result = await ghl_client.update_contact(contact_id, update_payload)
             action = "UPDATE"
 
             if result:
-                logger.info(
-                    f"Updated GHL contact {contact_id} "
-                    f"(match={match_method}, confidence={match_confidence})"
-                )
+                log_step("GHL_UPDATED", f"contact_id={contact_id}")
             else:
-                logger.error(f"Failed to update GHL contact {contact_id}")
+                log_step("GHL_UPDATE_FAILED", f"contact_id={contact_id}")
 
         else:
             # ── Create new contact ───────────────────────────────────────
             new_payload = data_merger.build_new_contact(extracted)
+            log_step("CREATING", f"payload keys: {list(new_payload.keys())}")
             result = await ghl_client.create_contact(new_payload)
             action = "CREATE"
 
             if result:
                 contact_id = result.get("id", "unknown")
-                logger.info(f"Created new GHL contact {contact_id}")
+                log_step("GHL_CREATED", f"contact_id={contact_id}")
             else:
                 contact_id = "failed"
-                logger.error("Failed to create GHL contact")
+                log_step("GHL_CREATE_FAILED", "no result returned")
 
         # ── Record in local database ─────────────────────────────────────
         biz = extracted.get("business_info", {}) or {}
@@ -210,7 +234,6 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
         )
         db.add(extraction_record)
 
-        # Mark image as processed
         image_processor.mark_as_processed(
             fingerprint, image_info,
             contact_id=contact_id, action=action,
@@ -218,6 +241,10 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
         )
 
         db.commit()
+        log_step("DONE", f"action={action}, contact_id={contact_id}")
+
+        event["result"] = f"{action}_{contact_id}"
+        _debug_log.append(event)
 
         return {
             "status": "processed",
@@ -230,11 +257,14 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
         }
 
     except Exception as e:
-        logger.error(f"Webhook processing error: {e}", exc_info=True)
-        return JSONResponse(
-            status_code=500,
-            content={"status": "error", "error": str(e)},
-        )
+        error_tb = traceback.format_exc()
+        logger.error(f"Webhook processing error: {e}\n{error_tb}")
+        log_step("ERROR", f"{type(e).__name__}: {str(e)}")
+        event["result"] = f"error: {str(e)}"
+        event["traceback"] = error_tb
+        _debug_log.append(event)
+        # Always return 200 to Telegram so it doesn't retry endlessly
+        return {"status": "error", "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
