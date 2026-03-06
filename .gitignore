@@ -52,7 +52,6 @@ htmlcov/
 .tox/
 
 # Docker
-.dockerignore
 
 # OS
 .DS_Store
