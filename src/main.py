@@ -161,10 +161,12 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
         document_type = extracted.get("document_type", "OTHER")
         extraction_error = extracted.get("extraction_error")
 
+        stmt_nums = extracted.get("statement_numbers")
         log_step("EXTRACTED", (
             f"confidence={confidence}, type={document_type}, "
             f"error={extraction_error}, "
-            f"biz_name={extracted.get('business_info', {}).get('legal_name')}"
+            f"biz_name={extracted.get('business_info', {}).get('legal_name')}, "
+            f"statement_numbers={stmt_nums}"
         ))
 
         if confidence < settings.min_confidence_threshold:
