@@ -106,7 +106,7 @@ Use null for any field you cannot find or that is not visible in the image.
     "remaining_balance": "Remaining balance on current MCA"
   },
 
-  "statement_numbers": "IMPORTANT: Look for ANY masked account or statement identifiers anywhere on the document. These appear in columns labeled 'Statements', 'Account', or in tables with date periods. They look like XXXXXX5800, XXXXXXXXXXXX9112, XXXXXXXXXXXX1758 — a series of X characters followed by visible digits. Extract ALL unique ones you see as a comma-separated string. Include the X's exactly as shown. If you see a table of statements with periods/dates, extract the identifiers from the left column. Return null ONLY if no such masked identifiers exist anywhere in the image.",
+  "statement_numbers": "IMPORTANT: Look for ANY masked account or statement identifiers anywhere on the document. These appear in columns labeled 'Statements', 'Account', or in tables with date periods. They look like XXXXXX5800, XXXXXXXXXXXX9112, XXXXXXXXXXXX1758 — a series of X characters followed by visible digits. Extract ALL unique ones you see as a comma-separated string, ORDERED BY DATE with the MOST RECENT first and OLDEST last. Use the date/period column next to each statement to determine the order. Include the X's exactly as shown. Return null ONLY if no such masked identifiers exist anywhere in the image.",
 
   "iso_info": {
     "iso_name": "Name of the ISO/broker who submitted this lead (from header, footer, or watermark)",
