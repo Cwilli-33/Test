@@ -49,7 +49,7 @@ GHL_CUSTOM_FIELDS = {
     "num_existing_positions":   "FRvcdvhGlUqp9q9ewfXD",
 
     # Credit
-    "statement_number":         "kAIeGRkKHozoftwS79lF",
+    "statement_number":         "MryQkbINuPBPYVW0CAl0",
 
     # Owner 1 home address
     "owner1_address":           "DUonmL5QgCisIDqFlPLy",
