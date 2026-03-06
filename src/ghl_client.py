@@ -1,4 +1,5 @@
 """GoHighLevel API client — Private Integration (v2 API) support."""
+import asyncio
 import httpx
 import logging
 import uuid
@@ -10,6 +11,12 @@ logger = logging.getLogger(__name__)
 
 # Private Integration keys (pit-) use the v2 API
 V2_BASE_URL = "https://services.leadconnectorhq.com"
+
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 1.0  # seconds
+RETRY_MAX_DELAY = 30.0  # seconds
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 
 
 class GHLClient:
@@ -23,6 +30,75 @@ class GHLClient:
             "Version": "2021-07-28",
         }
 
+    async def _request_with_retry(
+        self,
+        method: str,
+        url: str,
+        label: str = "GHL API",
+        **kwargs,
+    ) -> httpx.Response:
+        """Make an HTTP request with exponential backoff retry on transient errors.
+
+        Args:
+            method: HTTP method (GET, POST, PUT, DELETE).
+            url: Request URL.
+            label: Human-readable label for log messages.
+            **kwargs: Passed through to httpx (headers, params, json, files, etc.).
+
+        Returns:
+            httpx.Response on success.
+
+        Raises:
+            Last exception if all retries exhausted.
+        """
+        last_error = None
+        timeout = kwargs.pop("timeout", 30.0)
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    response = await getattr(client, method.lower())(url, **kwargs)
+                    # Check if we got a retryable status code
+                    if response.status_code in RETRYABLE_STATUS_CODES:
+                        if attempt < MAX_RETRIES - 1:
+                            delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                            logger.warning(
+                                f"{label} returned {response.status_code} "
+                                f"(attempt {attempt + 1}/{MAX_RETRIES}), "
+                                f"retrying in {delay:.1f}s"
+                            )
+                            await asyncio.sleep(delay)
+                            continue
+                    response.raise_for_status()
+                    return response
+
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                if e.response.status_code in RETRYABLE_STATUS_CODES and attempt < MAX_RETRIES - 1:
+                    delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                    logger.warning(
+                        f"{label} failed with {e.response.status_code} "
+                        f"(attempt {attempt + 1}/{MAX_RETRIES}), "
+                        f"retrying in {delay:.1f}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout) as e:
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                    logger.warning(
+                        f"{label} connection error (attempt {attempt + 1}/{MAX_RETRIES}), "
+                        f"retrying in {delay:.1f}s: {e}"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                raise
+
+        raise last_error
+
     async def search_contacts(self, query: str) -> List[Dict[str, Any]]:
         """Search GHL contacts by a query string."""
         url = f"{self.base_url}/contacts/"
@@ -33,14 +109,15 @@ class GHLClient:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(url, headers=self.headers, params=params)
-                logger.debug(f"GHL search response: {response.status_code} {response.text[:500]}")
-                response.raise_for_status()
-                data = response.json()
-                contacts = data.get("contacts", [])
-                logger.info(f"GHL search '{query}' returned {len(contacts)} contacts")
-                return contacts
+            response = await self._request_with_retry(
+                "GET", url, label="GHL search",
+                headers=self.headers, params=params,
+            )
+            logger.debug(f"GHL search response: {response.status_code} {response.text[:500]}")
+            data = response.json()
+            contacts = data.get("contacts", [])
+            logger.info(f"GHL search '{query}' returned {len(contacts)} contacts")
+            return contacts
         except httpx.HTTPStatusError as e:
             logger.error(f"GHL search failed ({e.response.status_code}): {e.response.text}")
             return []
@@ -62,14 +139,15 @@ class GHLClient:
         }
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(url, headers=self.headers, params=params)
-                logger.debug(f"GHL field search response: {response.status_code} {response.text[:500]}")
-                response.raise_for_status()
-                data = response.json()
-                contacts = data.get("contacts", [])
-                logger.info(f"GHL search {field}='{value}' returned {len(contacts)} contacts")
-                return contacts
+            response = await self._request_with_retry(
+                "GET", url, label=f"GHL field search ({field})",
+                headers=self.headers, params=params,
+            )
+            logger.debug(f"GHL field search response: {response.status_code} {response.text[:500]}")
+            data = response.json()
+            contacts = data.get("contacts", [])
+            logger.info(f"GHL search {field}='{value}' returned {len(contacts)} contacts")
+            return contacts
         except httpx.HTTPStatusError as e:
             logger.error(f"GHL field search failed ({e.response.status_code}): {e.response.text}")
             return []
@@ -104,16 +182,17 @@ class GHLClient:
                 payload["customFields"] = cf
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                logger.debug(f"GHL create payload: {payload}")
-                response = await client.post(url, headers=self.headers, json=payload)
-                logger.debug(f"GHL create response: {response.status_code} {response.text[:500]}")
-                response.raise_for_status()
-                result = response.json()
-                contact = result.get("contact", result)
-                contact_id = contact.get("id", "unknown")
-                logger.info(f"Created GHL contact: {contact_id}")
-                return contact
+            logger.debug(f"GHL create payload: {payload}")
+            response = await self._request_with_retry(
+                "POST", url, label="GHL create contact",
+                headers=self.headers, json=payload,
+            )
+            logger.debug(f"GHL create response: {response.status_code} {response.text[:500]}")
+            result = response.json()
+            contact = result.get("contact", result)
+            contact_id = contact.get("id", "unknown")
+            logger.info(f"Created GHL contact: {contact_id}")
+            return contact
         except httpx.HTTPStatusError as e:
             logger.error(
                 f"GHL create failed ({e.response.status_code}): {e.response.text}"
@@ -139,14 +218,15 @@ class GHLClient:
                 payload["customFields"] = cf
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.put(url, headers=self.headers, json=payload)
-                logger.debug(f"GHL update response: {response.status_code} {response.text[:500]}")
-                response.raise_for_status()
-                result = response.json()
-                contact = result.get("contact", result)
-                logger.info(f"Updated GHL contact: {contact_id}")
-                return contact
+            response = await self._request_with_retry(
+                "PUT", url, label=f"GHL update contact {contact_id}",
+                headers=self.headers, json=payload,
+            )
+            logger.debug(f"GHL update response: {response.status_code} {response.text[:500]}")
+            result = response.json()
+            contact = result.get("contact", result)
+            logger.info(f"Updated GHL contact: {contact_id}")
+            return contact
         except httpx.HTTPStatusError as e:
             logger.error(
                 f"GHL update failed ({e.response.status_code}): {e.response.text}"
@@ -161,11 +241,12 @@ class GHLClient:
         url = f"{self.base_url}/contacts/{contact_id}"
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.get(url, headers=self.headers)
-                response.raise_for_status()
-                result = response.json()
-                return result.get("contact", result)
+            response = await self._request_with_retry(
+                "GET", url, label=f"GHL get contact {contact_id}",
+                headers=self.headers,
+            )
+            result = response.json()
+            return result.get("contact", result)
         except httpx.HTTPStatusError as e:
             logger.error(f"GHL get contact failed ({e.response.status_code}): {e.response.text}")
             return None
@@ -245,21 +326,21 @@ class GHLClient:
         files_payload.append((new_field_name, (filename, file_bytes, content_type)))
 
         try:
-            async with httpx.AsyncClient(timeout=90.0) as client:
-                response = await client.post(
-                    url, headers=upload_headers, params=params, files=files_payload
-                )
-                logger.debug(
-                    f"GHL file upload response: {response.status_code} {response.text[:500]}"
-                )
-                response.raise_for_status()
-                result = response.json()
-                total = len(files_payload)
-                logger.info(
-                    f"Uploaded {total} file(s) (1 new + {total - 1} existing) to "
-                    f"custom field {custom_field_id} on contact {contact_id}"
-                )
-                return result.get("contact", result)
+            response = await self._request_with_retry(
+                "POST", url, label="GHL file upload",
+                headers=upload_headers, params=params, files=files_payload,
+                timeout=90.0,
+            )
+            logger.debug(
+                f"GHL file upload response: {response.status_code} {response.text[:500]}"
+            )
+            result = response.json()
+            total = len(files_payload)
+            logger.info(
+                f"Uploaded {total} file(s) (1 new + {total - 1} existing) to "
+                f"custom field {custom_field_id} on contact {contact_id}"
+            )
+            return result.get("contact", result)
         except httpx.HTTPStatusError as e:
             logger.error(
                 f"GHL file upload failed ({e.response.status_code}): {e.response.text}"

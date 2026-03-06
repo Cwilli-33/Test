@@ -1,13 +1,15 @@
 """Main FastAPI application — Telegram → Claude Vision → GHL pipeline."""
 import json
 import logging
+import os
+import secrets
 import sys
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
 from datetime import datetime
 
-from fastapi import FastAPI, Request, Depends
+from fastapi import FastAPI, Request, Depends, HTTPException, Header
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 
@@ -18,14 +20,17 @@ from src.claude_extractor import ClaudeExtractor
 from src.ghl_client import GHLClient
 from src.lead_matcher import LeadMatcher
 from src.data_merger import DataMerger
-from src.models import LeadExtraction
+from src.models import LeadExtraction, ProcessedImage
 
 logging.basicConfig(
-    level="DEBUG",
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+# Admin auth token — set ADMIN_API_KEY env var, or a random one is generated each boot
+ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY", secrets.token_urlsafe(32))
 
 # Store last 20 webhook results for debugging via /admin/debug
 _debug_log = deque(maxlen=20)
@@ -40,6 +45,9 @@ async def lifespan(app: FastAPI):
     logger.info(f"Claude key set: {bool(settings.claude_api_key)}")
     logger.info(f"GHL key set: {bool(settings.ghl_api_key)}")
     logger.info(f"GHL location: {settings.ghl_location_id}")
+    logger.info(f"Webhook secret configured: {bool(settings.webhook_secret)}")
+    if not os.environ.get("ADMIN_API_KEY"):
+        logger.info(f"Auto-generated ADMIN_API_KEY (set env var to persist): {ADMIN_API_KEY}")
     yield
     logger.info("Shutting down...")
 
@@ -85,9 +93,16 @@ async def health_check():
 # Debug endpoint — view recent webhook activity
 # ---------------------------------------------------------------------------
 
+async def _verify_admin(x_api_key: str = Header(None)):
+    """Verify admin API key for protected endpoints."""
+    if not x_api_key or not secrets.compare_digest(x_api_key, ADMIN_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid or missing X-Api-Key header")
+
+
 @app.get("/admin/debug")
-async def debug_log():
+async def debug_log(x_api_key: str = Header(None)):
     """View the last 20 webhook processing results."""
+    await _verify_admin(x_api_key)
     return {"count": len(_debug_log), "events": list(_debug_log)}
 
 
@@ -98,6 +113,13 @@ async def debug_log():
 @app.post("/webhook/telegram")
 async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db)):
     """Process incoming Telegram messages containing images."""
+    # ── Webhook secret validation ─────────────────────────────────────
+    if settings.webhook_secret:
+        token = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not secrets.compare_digest(token, settings.webhook_secret):
+            logger.warning("Webhook rejected: invalid or missing secret token")
+            raise HTTPException(status_code=403, detail="Invalid webhook secret")
+
     event = {"timestamp": datetime.utcnow().isoformat(), "steps": []}
 
     def log_step(step: str, detail: str = ""):
@@ -148,6 +170,25 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
 
         log_step("FINGERPRINT", fingerprint)
 
+        # ── Claim fingerprint immediately (prevents race condition) ──────
+        # Insert a placeholder record BEFORE heavy processing so a second
+        # webhook for the same image (which can arrive <1 s later) will
+        # see it as a duplicate and skip.
+        placeholder = ProcessedImage(
+            fingerprint=fingerprint,
+            file_id=image_info["file_id"],
+            message_id=image_info["message_id"],
+            chat_id=str(image_info["chat_id"]),
+            contact_id=None,
+            action="PROCESSING",
+            confidence=None,
+            document_type=None,
+            processed_at=datetime.utcnow(),
+        )
+        db.add(placeholder)
+        db.commit()
+        log_step("FINGERPRINT_CLAIMED", "placeholder inserted to prevent race condition")
+
         # ── Download and encode ──────────────────────────────────────────
         image_bytes = await image_processor.download_image(file_id)
         image_base64 = image_processor.image_to_base64(image_bytes)
@@ -176,6 +217,7 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
                 contact_id=None, action="SKIPPED_LOW_CONFIDENCE",
                 confidence=confidence, document_type=document_type, db=db,
             )
+            db.commit()
             event["result"] = "skipped_low_confidence"
             _debug_log.append(event)
             return {"status": "skipped", "reason": "low_confidence", "confidence": confidence}
@@ -309,8 +351,9 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
 # ---------------------------------------------------------------------------
 
 @app.post("/admin/cleanup-fingerprints")
-async def cleanup_fingerprints(db: Session = Depends(get_db)):
+async def cleanup_fingerprints(db: Session = Depends(get_db), x_api_key: str = Header(None)):
     """Remove old image fingerprints based on configured TTL."""
+    await _verify_admin(x_api_key)
     image_processor.cleanup_old_fingerprints(db)
     return {"status": "ok", "message": "Old fingerprints cleaned up"}
 

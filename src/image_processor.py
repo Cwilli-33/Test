@@ -106,19 +106,32 @@ class ImageProcessor:
         document_type: Optional[str],
         db: Session,
     ):
-        processed = ProcessedImage(
-            fingerprint=fingerprint,
-            file_id=image_info["file_id"],
-            message_id=image_info["message_id"],
-            chat_id=str(image_info["chat_id"]),
-            contact_id=contact_id,
-            action=action,
-            confidence=confidence,
-            document_type=document_type,
-            processed_at=datetime.utcnow(),
-        )
-        db.add(processed)
-        db.commit()
+        # Update the existing placeholder record (claimed during race-condition
+        # prevention) rather than inserting a new one.
+        existing = db.query(ProcessedImage).filter(
+            ProcessedImage.fingerprint == fingerprint
+        ).first()
+
+        if existing:
+            existing.contact_id = contact_id
+            existing.action = action
+            existing.confidence = confidence
+            existing.document_type = document_type
+            existing.processed_at = datetime.utcnow()
+        else:
+            # Fallback: insert fresh record if placeholder wasn't created
+            processed = ProcessedImage(
+                fingerprint=fingerprint,
+                file_id=image_info["file_id"],
+                message_id=image_info["message_id"],
+                chat_id=str(image_info["chat_id"]),
+                contact_id=contact_id,
+                action=action,
+                confidence=confidence,
+                document_type=document_type,
+                processed_at=datetime.utcnow(),
+            )
+            db.add(processed)
         logger.info(f"Marked image {fingerprint} as processed ({action})")
 
     def cleanup_old_fingerprints(self, db: Session):

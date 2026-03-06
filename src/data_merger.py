@@ -294,8 +294,15 @@ class DataMerger:
         self._set_custom_numeric(custom, existing_custom, "num_chargeoffs", credit.get("num_chargeoffs"))
         self._set_custom_numeric(custom, existing_custom, "leverage_pct", credit.get("leverage_pct"))
 
-        # Statement numbers — top-level field from extraction (not inside credit_info)
-        self._set_custom(custom, "statement_number", extracted.get("statement_numbers"))
+        # Statement numbers — accumulate across documents, don't overwrite
+        new_stmts = extracted.get("statement_numbers")
+        if new_stmts:
+            existing_stmts = existing_custom.get(GHL_CUSTOM_FIELDS.get("statement_number", ""), "")
+            merged = self._merge_statement_numbers(existing_stmts, new_stmts)
+            if merged:
+                ghl_id = GHL_CUSTOM_FIELDS.get("statement_number")
+                if ghl_id:
+                    custom[ghl_id] = merged
 
         # --- MCA positions ---
         self._set_custom_numeric(custom, existing_custom, "num_positions", mca.get("num_positions"))
@@ -350,7 +357,11 @@ class DataMerger:
             new_tags.append(f"matched-{match_method.lower()}")
 
         mca = extracted.get("mca_info", {}) or {}
-        if mca.get("has_existing_positions") or mca.get("num_positions"):
+        has_positions = mca.get("has_existing_positions")
+        # Guard against string "false" being truthy
+        if isinstance(has_positions, str):
+            has_positions = has_positions.lower() not in ("false", "no", "none", "0", "")
+        if has_positions or mca.get("num_positions"):
             new_tags.append("existing-mca")
 
         fin = extracted.get("financial_info", {}) or {}
@@ -506,6 +517,29 @@ class DataMerger:
             return float(val)
         except (ValueError, TypeError):
             return None
+
+    @staticmethod
+    def _merge_statement_numbers(existing: str, new: str) -> str:
+        """Merge existing and new statement numbers, deduplicating.
+
+        Both values are comma-separated strings like
+        'XXXXXX5800, XXXXXXXXXXXX9112'. Returns a single deduplicated
+        comma-separated string preserving order (new first, then any
+        existing ones not already present).
+        """
+        seen = set()
+        result = []
+
+        for raw in [new, existing]:
+            if not raw:
+                continue
+            for item in raw.split(","):
+                item = item.strip()
+                if item and item not in seen:
+                    seen.add(item)
+                    result.append(item)
+
+        return ", ".join(result)
 
     @staticmethod
     def _clean_phone(raw: str) -> str:

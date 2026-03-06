@@ -1,13 +1,20 @@
 """Claude Vision API integration for extracting structured lead data from images."""
+import asyncio
 import json
 import logging
 import re
 from typing import Any, Dict, Optional
 
-from anthropic import Anthropic
+from anthropic import AsyncAnthropic
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# Retry configuration
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 1.0  # seconds
+RETRY_MAX_DELAY = 30.0  # seconds
+RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 529}
 
 EXTRACTION_PROMPT = """You are an expert data extraction system for MCA (Merchant Cash Advance) lead processing.
 
@@ -130,7 +137,7 @@ IMPORTANT RULES:
 
 class ClaudeExtractor:
     def __init__(self):
-        self.client = Anthropic(api_key=settings.claude_api_key)
+        self.client = AsyncAnthropic(api_key=settings.claude_api_key)
         self.model = settings.claude_model
         self.max_tokens = settings.claude_max_tokens
         self.timeout = settings.claude_timeout
@@ -148,29 +155,7 @@ class ClaudeExtractor:
         try:
             logger.info("Sending image to Claude Vision for extraction")
 
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": media_type,
-                                    "data": image_base64,
-                                },
-                            },
-                            {
-                                "type": "text",
-                                "text": EXTRACTION_PROMPT,
-                            },
-                        ],
-                    }
-                ],
-            )
+            response = await self._call_with_retry(image_base64, media_type)
 
             raw_text = response.content[0].text
             extracted = self._parse_response(raw_text)
@@ -192,6 +177,61 @@ class ClaudeExtractor:
         except Exception as e:
             logger.error(f"Claude extraction failed: {e}", exc_info=True)
             return self._empty_extraction(error=str(e))
+
+    async def _call_with_retry(self, image_base64: str, media_type: str):
+        """Call Claude API with exponential backoff retry on transient errors."""
+        last_error = None
+
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = await self.client.messages.create(
+                    model=self.model,
+                    max_tokens=self.max_tokens,
+                    timeout=float(self.timeout),
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": media_type,
+                                        "data": image_base64,
+                                    },
+                                },
+                                {
+                                    "type": "text",
+                                    "text": EXTRACTION_PROMPT,
+                                },
+                            ],
+                        }
+                    ],
+                )
+                return response
+
+            except Exception as e:
+                last_error = e
+                # Check if this is a retryable error
+                status_code = getattr(getattr(e, "response", None), "status_code", None)
+                is_retryable = (
+                    status_code in RETRYABLE_STATUS_CODES
+                    or "overloaded" in str(e).lower()
+                    or "timeout" in str(e).lower()
+                    or "connection" in str(e).lower()
+                )
+
+                if not is_retryable or attempt == MAX_RETRIES - 1:
+                    raise
+
+                delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                logger.warning(
+                    f"Claude API call failed (attempt {attempt + 1}/{MAX_RETRIES}), "
+                    f"retrying in {delay:.1f}s: {e}"
+                )
+                await asyncio.sleep(delay)
+
+        raise last_error  # Should never reach here, but just in case
 
     def _parse_response(self, raw_text: str) -> Dict[str, Any]:
         """Parse Claude's response text into structured JSON.
