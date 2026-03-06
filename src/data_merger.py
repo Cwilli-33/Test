@@ -48,6 +48,9 @@ GHL_CUSTOM_FIELDS = {
     "num_positions":            "fKaTtIOb9JTypnAMUhx4",
     "num_existing_positions":   "FRvcdvhGlUqp9q9ewfXD",
 
+    # Credit
+    "statement_number":         "kAIeGRkKHozoftwS79lF",
+
     # Owner 1 home address
     "owner1_address":           "DUonmL5QgCisIDqFlPLy",
     "owner1_city":              "Pn4y4ppf4R5PLjJwRzcQ",
@@ -290,6 +293,7 @@ class DataMerger:
         self._set_custom_numeric(custom, existing_custom, "now_delinquent", credit.get("now_delinquent"))
         self._set_custom_numeric(custom, existing_custom, "num_chargeoffs", credit.get("num_chargeoffs"))
         self._set_custom_numeric(custom, existing_custom, "leverage_pct", credit.get("leverage_pct"))
+        self._set_custom(custom, "statement_number", credit.get("statement_number"))
 
         # --- MCA positions ---
         self._set_custom_numeric(custom, existing_custom, "num_positions", mca.get("num_positions"))

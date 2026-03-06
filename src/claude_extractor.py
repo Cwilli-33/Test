@@ -94,7 +94,8 @@ Use null for any field you cannot find or that is not visible in the image.
     "total_tradelines": "Total number of tradelines",
     "now_delinquent": "Number of currently delinquent accounts",
     "num_chargeoffs": "Number of charge-offs",
-    "leverage_pct": "Credit utilization / leverage percentage as a number"
+    "leverage_pct": "Credit utilization / leverage percentage as a number",
+    "statement_number": "Statement number / reference number / report ID shown on credit reports or financial scrub documents (e.g. 'STM-12345', '20260305-001', or any unique identifier printed on the document)"
   },
 
   "mca_info": {
@@ -263,7 +264,7 @@ class ClaudeExtractor:
                 "fico_owner1": None, "fico_owner2": None,
                 "satisfactory_accounts": None, "total_tradelines": None,
                 "now_delinquent": None, "num_chargeoffs": None,
-                "leverage_pct": None,
+                "leverage_pct": None, "statement_number": None,
             },
             "mca_info": {
                 "has_existing_positions": None, "num_positions": None,
