@@ -179,7 +179,10 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
             return {"status": "skipped", "reason": "low_confidence", "confidence": confidence}
 
         # ── Match against existing GHL contacts ──────────────────────────
-        matched_contact, match_method, match_confidence = await lead_matcher.find_match(extracted)
+        chat_id_str = str(image_info["chat_id"])
+        matched_contact, match_method, match_confidence = await lead_matcher.find_match(
+            extracted, chat_id=chat_id_str, db=db
+        )
         log_step("MATCHED", f"method={match_method}, confidence={match_confidence}, found={bool(matched_contact)}")
 
         contact_id: str
