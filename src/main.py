@@ -7,7 +7,7 @@ import sys
 import traceback
 from collections import deque
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from fastapi import FastAPI, Request, Depends, HTTPException, Header
 from fastapi.responses import JSONResponse
@@ -121,6 +121,7 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
             raise HTTPException(status_code=403, detail="Invalid webhook secret")
 
     event = {"timestamp": datetime.utcnow().isoformat(), "steps": []}
+    fingerprint = None  # Track for cleanup on error
 
     def log_step(step: str, detail: str = ""):
         entry = {"step": step, "detail": detail}
@@ -342,6 +343,22 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
         event["result"] = f"error: {str(e)}"
         event["traceback"] = error_tb
         _debug_log.append(event)
+
+        # Clean up the PROCESSING placeholder so the image can be retried
+        # on the next Telegram webhook delivery (or manual re-send).
+        try:
+            if fingerprint:
+                stale = db.query(ProcessedImage).filter(
+                    ProcessedImage.fingerprint == fingerprint,
+                    ProcessedImage.action == "PROCESSING",
+                ).first()
+                if stale:
+                    db.delete(stale)
+                    db.commit()
+                    logger.info(f"Removed stale PROCESSING record for {fingerprint}")
+        except Exception:
+            logger.warning("Could not clean up stale PROCESSING record", exc_info=True)
+
         # Always return 200 to Telegram so it doesn't retry endlessly
         return {"status": "error", "error": str(e)}
 
@@ -352,10 +369,26 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
 
 @app.post("/admin/cleanup-fingerprints")
 async def cleanup_fingerprints(db: Session = Depends(get_db), x_api_key: str = Header(None)):
-    """Remove old image fingerprints based on configured TTL."""
+    """Remove old image fingerprints based on configured TTL,
+    plus any stale PROCESSING records older than 10 minutes."""
     await _verify_admin(x_api_key)
     image_processor.cleanup_old_fingerprints(db)
-    return {"status": "ok", "message": "Old fingerprints cleaned up"}
+
+    # Also clean up stale PROCESSING records (failed mid-pipeline)
+    stale_cutoff = datetime.utcnow() - timedelta(minutes=10)
+    stale_count = (
+        db.query(ProcessedImage)
+        .filter(
+            ProcessedImage.action == "PROCESSING",
+            ProcessedImage.processed_at < stale_cutoff,
+        )
+        .delete()
+    )
+    if stale_count:
+        db.commit()
+        logger.info(f"Cleaned up {stale_count} stale PROCESSING records")
+
+    return {"status": "ok", "message": f"Cleaned up fingerprints and {stale_count} stale records"}
 
 
 if __name__ == "__main__":
