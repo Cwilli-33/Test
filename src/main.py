@@ -90,18 +90,25 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
     """
     try:
         data = await request.json()
-        logger.info(f"Received Telegram webhook")
+        logger.info(f"Received Telegram webhook: keys={list(data.keys())}")
 
         # ── Extract the message ──────────────────────────────────────────
         message = data.get("message") or data.get("channel_post")
         if not message:
-            logger.debug("Webhook contained no message — ignoring")
+            logger.info(f"Webhook contained no message — ignoring. Full payload keys: {list(data.keys())}")
             return {"status": "ignored", "reason": "no_message"}
+
+        logger.info(
+            f"Message from chat {message.get('chat', {}).get('id')} "
+            f"(type={message.get('chat', {}).get('type')}), "
+            f"has photo={bool(message.get('photo'))}, "
+            f"has document={bool(message.get('document'))}"
+        )
 
         # ── Check for an image ───────────────────────────────────────────
         image_info = image_processor.extract_image_from_message(message)
         if not image_info:
-            logger.debug("Message has no photo — ignoring")
+            logger.info("Message has no photo or image document — ignoring")
             return {"status": "ignored", "reason": "no_photo"}
 
         file_id = image_info["file_id"]
@@ -122,8 +129,8 @@ async def handle_telegram_webhook(request: Request, db: Session = Depends(get_db
         image_bytes = await image_processor.download_image(file_id)
         image_base64 = image_processor.image_to_base64(image_bytes)
 
-        # Determine media type from Telegram (they always serve JPEG for photos)
-        media_type = "image/jpeg"
+        # Use media type detected by image processor
+        media_type = image_info.get("media_type", "image/jpeg")
 
         # ── Extract data with Claude Vision ──────────────────────────────
         extracted = await claude_extractor.extract(image_base64, media_type)
