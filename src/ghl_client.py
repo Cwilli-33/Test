@@ -29,6 +29,21 @@ class GHLClient:
             "Content-Type": "application/json",
             "Version": "2021-07-28",
         }
+        # Shared persistent HTTP client — reuses TCP connections across all
+        # GHL API calls instead of opening a new connection every time.
+        self._client = httpx.AsyncClient(
+            timeout=30.0,
+            limits=httpx.Limits(
+                max_connections=20,
+                max_keepalive_connections=10,
+                keepalive_expiry=30,
+            ),
+        )
+
+    async def close(self):
+        """Close the shared HTTP client (call on app shutdown)."""
+        await self._client.aclose()
+        logger.info("GHL HTTP client closed")
 
     async def _request_with_retry(
         self,
@@ -52,25 +67,29 @@ class GHLClient:
             Last exception if all retries exhausted.
         """
         last_error = None
-        timeout = kwargs.pop("timeout", 30.0)
+        # Allow per-call timeout override (e.g. file uploads use 90s)
+        timeout_override = kwargs.pop("timeout", None)
 
         for attempt in range(MAX_RETRIES):
             try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    response = await getattr(client, method.lower())(url, **kwargs)
-                    # Check if we got a retryable status code
-                    if response.status_code in RETRYABLE_STATUS_CODES:
-                        if attempt < MAX_RETRIES - 1:
-                            delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
-                            logger.warning(
-                                f"{label} returned {response.status_code} "
-                                f"(attempt {attempt + 1}/{MAX_RETRIES}), "
-                                f"retrying in {delay:.1f}s"
-                            )
-                            await asyncio.sleep(delay)
-                            continue
-                    response.raise_for_status()
-                    return response
+                request_kwargs = {**kwargs}
+                if timeout_override is not None:
+                    request_kwargs["timeout"] = timeout_override
+
+                response = await getattr(self._client, method.lower())(url, **request_kwargs)
+                # Check if we got a retryable status code
+                if response.status_code in RETRYABLE_STATUS_CODES:
+                    if attempt < MAX_RETRIES - 1:
+                        delay = min(RETRY_BASE_DELAY * (2 ** attempt), RETRY_MAX_DELAY)
+                        logger.warning(
+                            f"{label} returned {response.status_code} "
+                            f"(attempt {attempt + 1}/{MAX_RETRIES}), "
+                            f"retrying in {delay:.1f}s"
+                        )
+                        await asyncio.sleep(delay)
+                        continue
+                response.raise_for_status()
+                return response
 
             except httpx.HTTPStatusError as e:
                 last_error = e
@@ -362,29 +381,29 @@ class GHLClient:
             List of (filename, file_bytes, mime_type, original_uuid) tuples.
         """
         results = []
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            for file_uuid, file_info in field_value.items():
-                if not isinstance(file_info, dict):
-                    continue
-                meta = file_info.get("meta", {})
-                download_url = file_info.get("url")
-                if not download_url:
-                    continue
+        for file_uuid, file_info in field_value.items():
+            if not isinstance(file_info, dict):
+                continue
+            meta = file_info.get("meta", {})
+            download_url = file_info.get("url")
+            if not download_url:
+                continue
 
-                fname = meta.get("originalname", "existing_file.jpg")
-                mime = meta.get("mimetype", "image/jpeg")
+            fname = meta.get("originalname", "existing_file.jpg")
+            mime = meta.get("mimetype", "image/jpeg")
 
-                try:
-                    resp = await client.get(
-                        download_url,
-                        headers={"Authorization": f"Bearer {self.api_key}"},
-                        follow_redirects=True,
-                    )
-                    resp.raise_for_status()
-                    results.append((fname, resp.content, mime, file_uuid))
-                    logger.debug(f"Re-downloaded existing file: {fname} ({len(resp.content)} bytes)")
-                except Exception as e:
-                    logger.warning(f"Could not re-download {fname}: {e}")
+            try:
+                resp = await self._client.get(
+                    download_url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    follow_redirects=True,
+                    timeout=60.0,
+                )
+                resp.raise_for_status()
+                results.append((fname, resp.content, mime, file_uuid))
+                logger.debug(f"Re-downloaded existing file: {fname} ({len(resp.content)} bytes)")
+            except Exception as e:
+                logger.warning(f"Could not re-download {fname}: {e}")
 
         return results
 

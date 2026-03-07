@@ -50,6 +50,7 @@ async def lifespan(app: FastAPI):
         logger.info(f"Auto-generated ADMIN_API_KEY (set env var to persist): {ADMIN_API_KEY}")
     yield
     logger.info("Shutting down...")
+    await ghl_client.close()
 
 
 app = FastAPI(
