@@ -1,61 +1,86 @@
-# Telegram → GHL Pipeline
+# Telegram Lead Capture Pipeline
 
-Production-grade Python/FastAPI application for automated MCA lead processing.
+Automatically extract MCA (Merchant Cash Advance) lead data from images sent to a Telegram group and push it into GoHighLevel CRM — no manual data entry required.
 
-## Quick Start
+## What It Does
 
-```bash
-# 1. Copy .env.example to .env and add your API keys
-cp .env.example .env
-nano .env
+1. **You send a photo** of an MCA application, bank statement, credit report, or any lead document to your Telegram group
+2. **AI reads the image** using Claude Vision and extracts all business info, owner details, financials, credit scores, and MCA history
+3. **Smart matching** finds whether the lead already exists in your GHL CRM (by EIN, phone, email, or business name)
+4. **Creates or updates** the GHL contact with all extracted data across 30+ custom fields
+5. **Attaches the source document** to the contact's file upload field for reference
 
-# 2. Create virtual environment
-python3 -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
+No duplicates. No manual typing. Works with blurry photos, screenshots, PDFs-as-images — anything Claude Vision can read.
 
-# 3. Install dependencies
-pip install -r requirements.txt
+## What Gets Extracted
 
-# 4. Initialize database
-python3 -c "from src.database import init_db; init_db()"
+| Category | Fields |
+|----------|--------|
+| **Business** | Legal name, DBA, EIN, address, phone, email, website, industry, entity type, start date, state of incorporation |
+| **Owner** | First/last name, phone, email, SSN last 4, DOB, ownership %, title, home address |
+| **Owner 2** | Full name, phone, ownership %, FICO |
+| **Financials** | Monthly revenue, annual revenue, funding requested, avg daily balance, 3-month true revenue |
+| **Credit** | FICO score (owner 1 & 2), tradelines, delinquencies, charge-offs, leverage % |
+| **MCA History** | Existing positions, number of positions, current funder, daily payment, remaining balance |
+| **Statement Numbers** | Masked account/statement identifiers (accumulated across multiple documents) |
+| **ISO/Source** | ISO name, source platform |
 
-# 5. Run application
-uvicorn src.main:app --reload
+## How It Works
+
 ```
-
-## Next Steps with Claude Code
-
-The starter files are created. Now use Claude Code to expand the implementation:
-
-```bash
-# In Claude Code, ask:
-claude code chat "Expand src/claude_extractor.py with the full Claude Vision implementation"
-claude code chat "Expand src/lead_matcher.py with multi-criteria matching logic"
-claude code chat "Expand src/data_merger.py with smart merge functionality"
-claude code chat "Expand src/ghl_client.py with complete GHL API integration"
-claude code chat "Complete the webhook handler in src/main.py"
+Telegram Group
+      |
+      v
+  [Webhook]  -->  Fingerprint check (skip duplicates)
+      |
+      v
+  Download image from Telegram
+      |
+      v
+  Claude Vision AI extracts structured data
+      |
+      v
+  Search GHL for existing contact (EIN > Phone > Email > Name)
+      |
+      v
+  Match found?
+   /        \
+  YES        NO
+  |           |
+  Update     Create
+  contact    new contact
+      |
+      v
+  Upload source image to contact
+      |
+      v
+  Done - contact enriched in GHL
 ```
-
-## Features
-
-- ✅ Image fingerprinting (prevents duplicates)
-- ✅ Database models and migrations
-- ✅ Docker support
-- ⏳ Claude Vision extraction (expand with Claude Code)
-- ⏳ Multi-criteria matching (expand with Claude Code)
-- ⏳ Smart data merging (expand with Claude Code)
-- ⏳ GHL API integration (expand with Claude Code)
 
 ## Documentation
 
-Full implementation details were provided in the original codebase.
-Use Claude Code to implement each module step by step.
+| Guide | What It Covers |
+|-------|---------------|
+| **[Setup Guide](docs/SETUP_GUIDE.md)** | Step-by-step: accounts to create, API keys to get, how to deploy |
+| **[GHL Custom Fields](docs/GHL_CUSTOM_FIELDS.md)** | Exact custom fields to create in your GHL location |
+| **[Troubleshooting](docs/TROUBLESHOOTING.md)** | Common problems and how to fix them |
+| **[Environment Variables](docs/ENV_REFERENCE.md)** | Every configuration option explained |
 
-## Architecture
+## Quick Facts
 
-```
-Telegram → Fingerprint → Download → Extract (Claude) →
-Match (Multi-criteria) → Merge (Smart) → GHL (Create/Update)
-```
+- **Language:** Python 3.11+ / FastAPI
+- **AI:** Anthropic Claude (Sonnet) for image extraction
+- **CRM:** GoHighLevel v2 API (Private Integration)
+- **Hosting:** Railway.app (recommended) or any Docker host
+- **Database:** SQLite (built-in, no setup needed)
+- **Cost:** ~$0.01-0.03 per image processed (Claude API usage)
 
-For full documentation, ask Claude Code to generate it based on the implementation.
+## Requirements
+
+You will need accounts with:
+1. **Telegram** (free) — for the bot that receives images
+2. **Anthropic** (pay-as-you-go) — for Claude AI image processing
+3. **GoHighLevel** (existing subscription) — your CRM
+4. **Railway.app** (free tier available) — to host the application
+
+See the [Setup Guide](docs/SETUP_GUIDE.md) for detailed instructions on each.
